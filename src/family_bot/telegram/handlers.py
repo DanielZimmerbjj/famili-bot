@@ -73,6 +73,37 @@ CORRECTION_MARKERS = (
 )
 
 
+def simple_command_pattern(
+    *commands: str,
+    plain: tuple[str, ...] = (),
+) -> re.Pattern[str]:
+    """Match a Telegram command even when a user adds harmless punctuation."""
+
+    slash_names = "|".join(re.escape(command) for command in commands)
+    alternatives = [rf"/(?:{slash_names})(?:@\w+)?"]
+    if plain:
+        plain_names = "|".join(re.escape(command) for command in plain)
+        alternatives.append(rf"(?:{plain_names})")
+    return re.compile(
+        rf"^(?:{'|'.join(alternatives)})\s*[.!?,;:…]*\s*$",
+        re.IGNORECASE,
+    )
+
+
+IDS_COMMAND_RE = simple_command_pattern("ids", "айди")
+SETUP_COMMAND_RE = simple_command_pattern("setup", "настроить")
+JOIN_COMMAND_RE = simple_command_pattern("join", "войти")
+BALANCE_COMMAND_RE = simple_command_pattern(
+    "balance", "report", "остаток", "отчет", plain=("остаток", "отчет")
+)
+TODAY_COMMAND_RE = simple_command_pattern("today", "сегодня", plain=("сегодня",))
+INCOME_COMMAND_RE = simple_command_pattern("income", "доходы", plain=("доходы",))
+CHART_COMMAND_RE = simple_command_pattern("chart", "график", plain=("график",))
+GOAL_COMMAND_RE = simple_command_pattern("goal", "goals", "цель", plain=("цель",))
+HELP_COMMAND_RE = simple_command_pattern("start", "help", "помощь", plain=("помощь",))
+CLOSE_COMMAND_RE = simple_command_pattern("close", "rollover", "закрыть")
+
+
 @dataclass(slots=True)
 class TelegramDependencies:
     settings: Settings
@@ -85,7 +116,7 @@ class TelegramDependencies:
 def build_router(deps: TelegramDependencies) -> Router:
     router = Router(name="family-budget")
 
-    @router.message(F.text.regexp(r"^/(?:ids|айди)(?:@\w+)?$"))
+    @router.message(F.text.regexp(IDS_COMMAND_RE))
     async def setup_ids(message: Message) -> None:
         if not deps.settings.setup_mode:
             return
@@ -95,7 +126,7 @@ def build_router(deps: TelegramDependencies) -> Router:
             "После настройки выключите SETUP_MODE."
         )
 
-    @router.message(F.text.regexp(r"^/(?:setup|настроить)(?:@\w+)?$"))
+    @router.message(F.text.regexp(SETUP_COMMAND_RE))
     async def setup_group(message: Message) -> None:
         if not deps.settings.setup_mode or message.from_user is None:
             return
@@ -127,7 +158,7 @@ def build_router(deps: TelegramDependencies) -> Router:
             "Затем можно присылать чеки, голосовые или писать расходы текстом."
         )
 
-    @router.message(F.text.regexp(r"^/(?:join|войти)(?:@\w+)?$"))
+    @router.message(F.text.regexp(JOIN_COMMAND_RE))
     async def join_household(message: Message) -> None:
         if not deps.settings.setup_mode or message.from_user is None:
             return
@@ -242,9 +273,7 @@ def build_router(deps: TelegramDependencies) -> Router:
         elif not image_added:
             await message.reply("ℹ️ Это изображение уже есть в очереди или было обработано.")
 
-    @router.message(
-        F.text.regexp(r"^/(?:balance|report|остаток|отчет)(?:@\w+)?$|^(?:остаток|отчет)$")
-    )
+    @router.message(F.text.regexp(BALANCE_COMMAND_RE))
     async def balance(message: Message) -> None:
         authorization = await authorize_message(message, deps)
         if authorization is None:
@@ -264,7 +293,7 @@ def build_router(deps: TelegramDependencies) -> Router:
             await session.commit()
         await message.answer(report)
 
-    @router.message(F.text.regexp(r"^/(?:today|сегодня)(?:@\w+)?$|^сегодня$"))
+    @router.message(F.text.regexp(TODAY_COMMAND_RE))
     async def today(message: Message) -> None:
         authorization = await authorize_message(message, deps)
         if authorization is None:
@@ -302,7 +331,7 @@ def build_router(deps: TelegramDependencies) -> Router:
         )
         await message.answer("\n".join(lines) if entries else "Сегодня расходов пока нет.")
 
-    @router.message(F.text.regexp(r"^/(?:income|доходы)(?:@\w+)?$|^доходы$"))
+    @router.message(F.text.regexp(INCOME_COMMAND_RE))
     async def incomes(message: Message) -> None:
         authorization = await authorize_message(message, deps)
         if authorization is None:
@@ -350,7 +379,7 @@ def build_router(deps: TelegramDependencies) -> Router:
             await session.commit()
         await message.answer("\n".join(lines))
 
-    @router.message(F.text.regexp(r"^/(?:chart|график)(?:@\w+)?$|^график$"))
+    @router.message(F.text.regexp(CHART_COMMAND_RE))
     async def chart(message: Message) -> None:
         authorization = await authorize_message(message, deps)
         if authorization is None:
@@ -371,7 +400,7 @@ def build_router(deps: TelegramDependencies) -> Router:
             caption="Лимиты и расходы текущего финансового месяца",
         )
 
-    @router.message(F.text.regexp(r"^/(?:goals?|цель)(?:@\w+)?$|^цель$"))
+    @router.message(F.text.regexp(GOAL_COMMAND_RE))
     async def goals(message: Message) -> None:
         authorization = await authorize_message(message, deps)
         if authorization is None:
@@ -395,7 +424,7 @@ def build_router(deps: TelegramDependencies) -> Router:
                 )
         await message.answer("\n".join(lines))
 
-    @router.message(F.text.regexp(r"^/(?:help|помощь)(?:@\w+)?$|^помощь$|^/start"))
+    @router.message(F.text.regexp(HELP_COMMAND_RE))
     async def help_message(message: Message) -> None:
         authorization = await authorize_message(message, deps, notify=False)
         if authorization is None and not deps.settings.setup_mode:
@@ -423,7 +452,7 @@ def build_router(deps: TelegramDependencies) -> Router:
             "Команды: /balance /today /income /chart /goal /close /help"
         )
 
-    @router.message(F.text.regexp(r"^/(?:close|rollover|закрыть)(?:@\w+)?$"))
+    @router.message(F.text.regexp(CLOSE_COMMAND_RE))
     async def close_cycle(message: Message) -> None:
         authorization = await authorize_message(message, deps, owner_only=True)
         if authorization is None:
@@ -1160,6 +1189,25 @@ async def authorize_message(
         else:
             household = await get_household_by_chat(session, message.chat.id)
             member = None
+            if (
+                household is None
+                and message.chat.type in {"group", "supergroup"}
+                and deps.settings.setup_mode
+                and deps.settings.telegram_owner_user_id == user_id
+            ):
+                household = await seed_household(
+                    session,
+                    deps.settings,
+                    message.chat.id,
+                    user_id,
+                )
+                await get_current_cycle(
+                    session,
+                    household,
+                    datetime.now(deps.settings.timezone).date(),
+                    deps.settings.financial_cycle_start_day,
+                )
+                await session.commit()
             if household is not None:
                 member = await session.scalar(
                     select(Member).where(
@@ -1170,10 +1218,16 @@ async def authorize_message(
                 )
         if household is None:
             if notify:
-                await message.reply(
-                    "Бюджет ещё не привязан. Добавьте бота в семейную группу и "
-                    "отправьте там <code>/setup</code>."
-                )
+                if message.chat.type == "private":
+                    await message.reply(
+                        "Бюджет ещё не привязан. Добавьте бота в семейную группу и "
+                        "отправьте там <code>/setup</code>."
+                    )
+                else:
+                    await message.reply(
+                        "Семейный бюджет в этой группе ещё не настроен. "
+                        "Пусть владелец отправит <code>/setup</code>."
+                    )
             return None
         if member is None:
             await message.reply("Вы не подключены к этому семейному бюджету.")
