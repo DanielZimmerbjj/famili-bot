@@ -96,6 +96,7 @@ CATEGORY_TEXT_ALIASES: dict[str, str] = {
     "продукты": "groceries_household",
     "бытовое": "groceries_household",
     "бытовая химия": "groceries_household",
+    "бытовую химию": "groceries_household",
     "фрукты": "fruit",
     "тренировка": "training",
     "тренировки": "training",
