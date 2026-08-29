@@ -3,6 +3,7 @@ from decimal import Decimal
 
 import pytest
 
+from family_bot.config import Settings
 from family_bot.services.money import RateQuote, convert, normalize_currency
 
 
@@ -28,3 +29,9 @@ def test_vnd_to_thb_through_kzt() -> None:
 )
 def test_currency_aliases(raw: str, expected: str) -> None:
     assert normalize_currency(raw) == expected
+
+
+@pytest.mark.parametrize("scheme", ["postgres://", "postgresql://"])
+def test_coolify_postgres_url_uses_async_driver(scheme: str) -> None:
+    settings = Settings(database_url=f"{scheme}user:password@database:5432/family")
+    assert settings.database_url.startswith("postgresql+asyncpg://")

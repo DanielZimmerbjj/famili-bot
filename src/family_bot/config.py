@@ -51,6 +51,15 @@ class Settings(BaseSettings):
     def normalize_base_currency(cls, value: str) -> str:
         return value.upper().strip()
 
+    @field_validator("database_url")
+    @classmethod
+    def use_async_postgres_driver(cls, value: str) -> str:
+        if value.startswith("postgres://"):
+            return value.replace("postgres://", "postgresql+asyncpg://", 1)
+        if value.startswith("postgresql://"):
+            return value.replace("postgresql://", "postgresql+asyncpg://", 1)
+        return value
+
     @property
     def timezone(self) -> ZoneInfo:
         return ZoneInfo(self.app_timezone)
