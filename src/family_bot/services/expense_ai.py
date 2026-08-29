@@ -15,6 +15,7 @@ class InterpretedExpenseItem(BaseModel):
     category_key: str | None = None
     goal_key: str | None = None
     goal_name: str | None = None
+    new_goal_name: str | None = None
     target_amount: float | None = Field(default=None, gt=0)
     target_currency: str | None = None
     target_item_number: int | None = Field(default=None, ge=1)
@@ -40,6 +41,7 @@ class ExpenseInterpretation(BaseModel):
         "goal_contribution",
         "goal_expense",
         "goal_target",
+        "goal_update",
         "report",
         "correction",
         "other",
@@ -140,7 +142,10 @@ Rules:
 - kind=income when money was received, including salary.
 - kind=goal_contribution when money was intentionally set aside into a savings goal.
 - kind=goal_expense when a payment must be taken from an existing savings fund.
-- kind=goal_target when the user only specifies or changes the total price of a savings goal.
+- kind=goal_target when the user establishes the total price of a savings goal without
+  explicitly asking to edit an existing goal.
+- kind=goal_update when the user explicitly asks to rename, replace or reprice an existing
+  savings goal. This updates the same goal and must never create a new one.
 - kind=report when the user asks to show, send or summarize the family finances, budget,
   expenses, income, balances, category limits or savings progress. A report is read-only.
 - kind=correction only when the user clearly corrects the previous operation, for example
@@ -159,9 +164,15 @@ Rules:
   target_currency separately from the contribution amount and currency.
 - For goal_target, return the goal key or name plus target_amount and target_currency.
   If the target currency is omitted, use KZT for this household.
+- For goal_update, identify the old existing goal in goal_key (preferred) or goal_name.
+  Put a replacement title such as "MacBook M6" in new_goal_name. Put a replacement price
+  in target_amount and target_currency. Leave either replacement field null when unchanged.
+  A phrase such as "измени цель MacBook M5 на MacBook M6, теперь он стоит миллион" is
+  goal_update even though it contains words such as "измени" or "вместо".
 - For report, return an empty items list. Requests such as "скинь отчет", "покажи бюджет",
   "сколько денег осталось" and "как у нас дела с накоплениями" are reports, not other.
 - For a correction, return only values that change; null means keep the previous value.
+  Do not use correction for editing a savings goal; use goal_update.
 - target_item_number is only for correcting a numbered receipt item.
 - category_key must be one of the allowed keys. Classify supermarket drinks, milk and snacks
   as groceries_household unless the message explicitly says they were consumed in a cafe.

@@ -918,6 +918,7 @@ async def handle_natural_operation(
                 "goal_contribution",
                 "goal_expense",
                 "goal_target",
+                "goal_update",
             }:
                 heading = (
                     "✅ <b>Добавлено в накопления</b>"
@@ -930,6 +931,63 @@ async def handle_natural_operation(
                 )
                 lines = [heading]
                 for item in interpretation.items:
+                    if interpretation.kind == "goal_update":
+                        goal = await load_existing_savings_goal(
+                            session,
+                            household,
+                            item,
+                            goal_by_key,
+                        )
+                        old_name = goal.name
+                        new_name = (item.new_goal_name or "").strip()
+                        changed = False
+                        if new_name and new_name.casefold() != old_name.casefold():
+                            normalized_name = " ".join(new_name.casefold().split())
+                            duplicate = next(
+                                (
+                                    existing
+                                    for existing in goal_by_key.values()
+                                    if existing.id != goal.id
+                                    and " ".join(existing.name.casefold().split())
+                                    == normalized_name
+                                ),
+                                None,
+                            )
+                            if duplicate is not None:
+                                raise ValueError(
+                                    f"цель «{new_name}» уже существует; уточните, "
+                                    "какую из целей изменить"
+                                )
+                            goal.name = new_name[:160]
+                            changed = True
+                        if item.target_amount is not None:
+                            await update_goal_target(
+                                session,
+                                deps.rate_service,
+                                goal,
+                                item,
+                                local_now.date(),
+                            )
+                            changed = True
+                        if not changed:
+                            raise ValueError(
+                                "не понял новое название или новую стоимость цели"
+                            )
+                        balance = await goal_balance(session, household.id, goal.id)
+                        target = Decimal(goal.target_amount)
+                        remaining = max(target - balance, Decimal("0"))
+                        title = (
+                            f"{escape(old_name)} → <b>{escape(goal.name)}</b>"
+                            if old_name != goal.name
+                            else f"<b>{escape(goal.name)}</b>"
+                        )
+                        lines.append(
+                            f"• {goal.icon} {title}: цель "
+                            f"{format_money(target)} ₸ · накоплено "
+                            f"{format_money(balance)} ₸ · осталось "
+                            f"{format_money(remaining)} ₸"
+                        )
+                        continue
                     goal = await resolve_savings_goal(
                         session,
                         deps.rate_service,
@@ -1030,18 +1088,17 @@ async def resolve_savings_goal(
     goal_by_key: dict[str, SavingsGoal],
     on_date: date,
 ) -> SavingsGoal:
-    goal = goal_by_key.get(item.goal_key or "")
-    requested_name = (item.goal_name or "").strip()
-    if goal is None and requested_name:
-        normalized_name = " ".join(requested_name.casefold().split())
-        goal = next(
-            (
-                existing
-                for existing in goal_by_key.values()
-                if " ".join(existing.name.casefold().split()) == normalized_name
-            ),
-            None,
+    candidate = find_existing_savings_goal(item, goal_by_key)
+    goal = None
+    if candidate is not None:
+        goal = await session.scalar(
+            select(SavingsGoal).where(
+                SavingsGoal.id == candidate.id,
+                SavingsGoal.household_id == household.id,
+                SavingsGoal.active.is_(True),
+            )
         )
+    requested_name = (item.goal_name or "").strip()
     if goal is None:
         requested_name = requested_name or (item.goal_key or "").strip()
         if not requested_name:
@@ -1071,11 +1128,68 @@ async def resolve_savings_goal(
         goal_by_key[goal.key] = goal
 
     if item.target_amount is not None:
-        target_currency = normalize_currency(item.target_currency or "KZT")
-        target_quote = await rate_service.get_quote(session, target_currency, on_date)
-        goal.target_amount = target_quote.to_kzt(Decimal(str(item.target_amount)))
-        goal.currency = "KZT"
+        await update_goal_target(session, rate_service, goal, item, on_date)
     return goal
+
+
+def find_existing_savings_goal(
+    item: InterpretedExpenseItem,
+    goal_by_key: dict[str, SavingsGoal],
+) -> SavingsGoal | None:
+    goal = goal_by_key.get(item.goal_key or "")
+    requested_name = (item.goal_name or "").strip()
+    if goal is not None or not requested_name:
+        return goal
+    normalized_name = " ".join(requested_name.casefold().split())
+    return next(
+        (
+            existing
+            for existing in goal_by_key.values()
+            if " ".join(existing.name.casefold().split()) == normalized_name
+        ),
+        None,
+    )
+
+
+async def load_existing_savings_goal(
+    session: AsyncSession,
+    household: Household,
+    item: InterpretedExpenseItem,
+    goal_by_key: dict[str, SavingsGoal],
+) -> SavingsGoal:
+    candidate = find_existing_savings_goal(item, goal_by_key)
+    if candidate is None:
+        requested = (item.goal_name or item.goal_key or "").strip()
+        suffix = f" «{requested}»" if requested else ""
+        raise ValueError(
+            f"не нашёл существующую цель{suffix}; назовите её так, как она указана "
+            "в разделе «Накопления»"
+        )
+    goal = await session.scalar(
+        select(SavingsGoal).where(
+            SavingsGoal.id == candidate.id,
+            SavingsGoal.household_id == household.id,
+            SavingsGoal.active.is_(True),
+        )
+    )
+    if goal is None:
+        raise ValueError("существующая цель больше недоступна")
+    return goal
+
+
+async def update_goal_target(
+    session: AsyncSession,
+    rate_service: RateService,
+    goal: SavingsGoal,
+    item: InterpretedExpenseItem,
+    on_date: date,
+) -> None:
+    if item.target_amount is None:
+        return
+    target_currency = normalize_currency(item.target_currency or "KZT")
+    target_quote = await rate_service.get_quote(session, target_currency, on_date)
+    goal.target_amount = target_quote.to_kzt(Decimal(str(item.target_amount)))
+    goal.currency = "KZT"
 
 
 async def latest_expense_context(
