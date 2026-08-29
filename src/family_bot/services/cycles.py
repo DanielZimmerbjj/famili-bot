@@ -110,11 +110,29 @@ async def seed_default_household(session: AsyncSession, settings: Settings) -> H
     if settings.telegram_allowed_chat_id is None:
         return None
 
-    household = await get_household_by_chat(session, settings.telegram_allowed_chat_id)
+    return await seed_household(
+        session,
+        settings,
+        settings.telegram_allowed_chat_id,
+        settings.telegram_owner_user_id,
+        settings.telegram_member_user_id,
+    )
+
+
+async def seed_household(
+    session: AsyncSession,
+    settings: Settings,
+    chat_id: int,
+    owner_user_id: int | None,
+    member_user_id: int | None = None,
+) -> Household:
+    """Create or complete a family household for a Telegram group."""
+
+    household = await get_household_by_chat(session, chat_id)
     if household is None:
         household = Household(
             name="Семья",
-            telegram_chat_id=settings.telegram_allowed_chat_id,
+            telegram_chat_id=chat_id,
             timezone=settings.app_timezone,
             base_currency=settings.base_currency,
         )
@@ -122,8 +140,8 @@ async def seed_default_household(session: AsyncSession, settings: Settings) -> H
         await session.flush()
 
     member_specs = (
-        (settings.telegram_owner_user_id, "owner"),
-        (settings.telegram_member_user_id, "member"),
+        (owner_user_id, "owner"),
+        (member_user_id, "member"),
     )
     for user_id, role in member_specs:
         if user_id is None:

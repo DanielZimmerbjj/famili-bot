@@ -19,6 +19,7 @@ class Settings(BaseSettings):
     app_name: str = "Family Budget Bot"
     app_timezone: str = "Asia/Bangkok"
     base_currency: str = "KZT"
+    default_spending_currency: str = "THB"
     log_level: str = "INFO"
 
     database_url: str = "postgresql+asyncpg://family_bot:family_bot@localhost/family_bot"
@@ -26,14 +27,18 @@ class Settings(BaseSettings):
     telegram_bot_token: SecretStr = SecretStr("")
     telegram_webhook_secret: SecretStr = SecretStr("")
     telegram_webhook_url: str = ""
+    telegram_delivery_mode: str = "polling"
     telegram_allowed_chat_id: int | None = None
     telegram_owner_user_id: int | None = None
     telegram_member_user_id: int | None = None
     setup_mode: bool = False
+    telegram_voice_max_seconds: int = Field(default=180, ge=1, le=1200)
 
     openai_api_key: SecretStr = SecretStr("")
     openai_receipt_model: str = "gpt-5.6-terra"
     openai_fallback_model: str = "gpt-5.6-sol"
+    openai_intent_model: str = "gpt-5.6-terra"
+    openai_transcription_model: str = "gpt-4o-mini-transcribe"
     openai_timeout_seconds: float = 90.0
 
     receipt_storage_path: Path = Path("receipts")
@@ -46,7 +51,7 @@ class Settings(BaseSettings):
     financial_cycle_start_day: int = Field(default=5, ge=1, le=28)
     auto_seed: bool = True
 
-    @field_validator("base_currency")
+    @field_validator("base_currency", "default_spending_currency")
     @classmethod
     def normalize_base_currency(cls, value: str) -> str:
         return value.upper().strip()
@@ -59,6 +64,14 @@ class Settings(BaseSettings):
         if value.startswith("postgresql://"):
             return value.replace("postgresql://", "postgresql+asyncpg://", 1)
         return value
+
+    @field_validator("telegram_delivery_mode")
+    @classmethod
+    def validate_delivery_mode(cls, value: str) -> str:
+        normalized = value.casefold().strip()
+        if normalized not in {"polling", "webhook"}:
+            raise ValueError("TELEGRAM_DELIVERY_MODE must be polling or webhook")
+        return normalized
 
     @property
     def timezone(self) -> ZoneInfo:

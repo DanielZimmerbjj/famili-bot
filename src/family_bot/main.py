@@ -17,6 +17,7 @@ from family_bot.config import Settings, get_settings
 from family_bot.database import Database
 from family_bot.models import ProcessedUpdate
 from family_bot.services.cycles import seed_default_household
+from family_bot.services.expense_ai import ExpenseInterpreter
 from family_bot.services.rates import RateService
 from family_bot.services.receipt_ai import ReceiptExtractor
 from family_bot.services.receipts import ReceiptService, ReceiptWorker
@@ -36,6 +37,7 @@ class Runtime:
     scheduler: ReportScheduler
     worker_task: asyncio.Task[None]
     scheduler_task: asyncio.Task[None]
+    polling_task: asyncio.Task[None] | None
 
 
 def create_app() -> FastAPI:
@@ -59,6 +61,14 @@ def create_app() -> FastAPI:
         dispatcher = Dispatcher()
         rate_service = RateService()
         receipt_service = ReceiptService(settings)
+        expense_interpreter = ExpenseInterpreter(
+            api_key=settings.openai_key,
+            intent_model=settings.openai_intent_model,
+            fallback_model=settings.openai_fallback_model,
+            transcription_model=settings.openai_transcription_model,
+            default_currency=settings.default_spending_currency,
+            timeout=settings.openai_timeout_seconds,
+        )
         extractor = ReceiptExtractor(
             api_key=settings.openai_key,
             model=settings.openai_receipt_model,
@@ -85,18 +95,35 @@ def create_app() -> FastAPI:
                     session_factory=database.session_factory,
                     rate_service=rate_service,
                     receipt_service=receipt_service,
+                    expense_interpreter=expense_interpreter,
                 )
             )
         )
         if settings.auto_seed:
             async with database.session_factory() as session, session.begin():
                 await seed_default_household(session, settings)
-        if settings.telegram_webhook_url:
+        polling_task: asyncio.Task[None] | None = None
+        if settings.telegram_delivery_mode == "webhook":
+            if not settings.telegram_webhook_url:
+                raise RuntimeError("TELEGRAM_WEBHOOK_URL is required in webhook mode")
             await bot.set_webhook(
                 settings.telegram_webhook_url,
                 secret_token=settings.webhook_secret or None,
                 allowed_updates=dispatcher.resolve_used_update_types(),
             )
+            await dispatcher.emit_startup(bot=bot)
+        else:
+            await bot.delete_webhook(drop_pending_updates=False)
+            polling_task = asyncio.create_task(
+                dispatcher.start_polling(
+                    bot,
+                    allowed_updates=dispatcher.resolve_used_update_types(),
+                    handle_signals=False,
+                    close_bot_session=False,
+                ),
+                name="telegram-polling",
+            )
+            logger.info("Telegram long polling started")
         worker_task = asyncio.create_task(worker.run(), name="receipt-worker")
         scheduler_task = asyncio.create_task(scheduler.run(), name="report-scheduler")
         app.state.runtime = Runtime(
@@ -108,16 +135,23 @@ def create_app() -> FastAPI:
             scheduler=scheduler,
             worker_task=worker_task,
             scheduler_task=scheduler_task,
+            polling_task=polling_task,
         )
         try:
             yield
         finally:
+            if polling_task is not None:
+                with suppress(RuntimeError):
+                    await dispatcher.stop_polling()
+                with suppress(asyncio.CancelledError):
+                    await polling_task
+            else:
+                await dispatcher.emit_shutdown(bot=bot)
             await worker.stop()
             await scheduler.stop()
             for task in (worker_task, scheduler_task):
                 with suppress(asyncio.CancelledError):
                     await task
-            await dispatcher.emit_shutdown(bot=bot)
             await bot.session.close()
             await database.dispose()
 
@@ -130,6 +164,8 @@ def create_app() -> FastAPI:
     @app.get("/health/ready")
     async def ready(request: Request) -> dict[str, str]:
         runtime: Runtime = request.app.state.runtime
+        if runtime.polling_task is not None and runtime.polling_task.done():
+            raise HTTPException(status_code=503, detail="Telegram polling stopped")
         async with runtime.database.session_factory() as session:
             await session.execute(text("SELECT 1"))
         return {"status": "ready"}

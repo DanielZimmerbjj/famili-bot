@@ -22,6 +22,7 @@ from family_bot.models import (
     BudgetCycle,
     Category,
     CategoryAlias,
+    ExchangeRate,
     Household,
     Receipt,
     ReceiptImage,
@@ -29,7 +30,7 @@ from family_bot.models import (
     Subcategory,
     utcnow,
 )
-from family_bot.services.ledger import post_expense
+from family_bot.services.ledger import allocation_and_spend, post_expense
 from family_bot.services.money import normalize_currency, quantize
 from family_bot.services.rates import RateService, RateUnavailableError
 from family_bot.services.receipt_ai import ExtractedItem, ReceiptExtraction, ReceiptExtractor
@@ -407,20 +408,39 @@ class ReceiptWorker:
                 await session.scalars(select(Category).where(Category.id.in_(category_ids)))
             ).all()
             names = {category.id: f"{category.icon} {category.name}" for category in categories}
-            grouped: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
-            for item in receipt.items:
-                if item.category_id:
-                    grouped[item.category_id] += Decimal(item.line_total)
             lines = [
                 f"✅ <b>{escape(receipt.merchant or 'Чек')}</b> · "
                 f"{format_money(receipt.original_total)} {receipt.original_currency}"
             ]
-            lines.extend(
-                f"{names.get(category_id, 'Категория')}: {format_money(amount)} "
-                f"{receipt.original_currency}"
-                for category_id, amount in grouped.items()
+            sorted_items = sorted(receipt.items, key=lambda item: item.created_at)
+            for index, item in enumerate(sorted_items, 1):
+                lines.append(
+                    f"{index}. {escape(item.raw_name)} — {format_money(item.line_total)} "
+                    f"{receipt.original_currency} → "
+                    f"{names.get(item.category_id, 'Категория')}"
+                )
+            if receipt.exchange_rate_id:
+                rate = await session.get(ExchangeRate, receipt.exchange_rate_id)
+                if rate is not None:
+                    per_unit = Decimal(rate.rate_kzt) / Decimal(rate.nominal)
+                    lines.append(
+                        f"Курс: 1 {receipt.original_currency} = "
+                        f"{format_money(per_unit)} ₸ ({rate.provider})"
+                    )
+            lines.append(f"Итого в учёте: <b>{format_money(receipt.total_kzt)} ₸</b>")
+            affected_category_ids = {item.category_id for item in sorted_items if item.category_id}
+            remaining_rows = await allocation_and_spend(session, receipt.cycle_id)
+            for category, limit, spent in remaining_rows:
+                if category.id not in affected_category_ids:
+                    continue
+                lines.append(
+                    f"{category.icon} {category.name}: осталось "
+                    f"<b>{format_money(limit - spent)} {category.envelope_currency}</b>"
+                )
+            lines.append(
+                "Неверно? Ответьте текстом или голосом: "
+                "<i>«нет, позиция 1 — молоко»</i>."
             )
-            lines.append(f"Итого в учёте: {format_money(receipt.total_kzt)} ₸")
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [

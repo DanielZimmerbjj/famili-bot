@@ -6,6 +6,7 @@ from dataclasses import dataclass
 from datetime import UTC, datetime, time
 from decimal import Decimal, InvalidOperation
 from html import escape
+from io import BytesIO
 
 from aiogram import F, Router
 from aiogram.types import BufferedInputFile, CallbackQuery, Message
@@ -23,12 +24,20 @@ from family_bot.models import (
     Household,
     IncomeSource,
     LedgerEntry,
+    Member,
     Receipt,
     ReceiptItem,
     SavingsGoal,
 )
-from family_bot.services.cycles import get_current_cycle, get_household_by_chat
+from family_bot.services.cycles import (
+    get_current_cycle,
+    get_household_by_chat,
+    seed_household,
+)
+from family_bot.services.expense_ai import ExpenseInterpretation, ExpenseInterpreter
 from family_bot.services.ledger import (
+    PostedEntry,
+    allocation_and_spend,
     cycle_rollover_kzt,
     get_category,
     goal_balance,
@@ -53,6 +62,15 @@ RATE_RE = re.compile(
     r"(?:\s+(?P<nominal>\d+(?:[.,]\d+)?))?$",
     re.IGNORECASE,
 )
+CORRECTION_MARKERS = (
+    "нет",
+    "исправ",
+    "ошиб",
+    "на самом деле",
+    "вместо",
+    "не фант",
+    "не кол",
+)
 
 
 @dataclass(slots=True)
@@ -61,6 +79,7 @@ class TelegramDependencies:
     session_factory: async_sessionmaker[AsyncSession]
     rate_service: RateService
     receipt_service: ReceiptService
+    expense_interpreter: ExpenseInterpreter
 
 
 def build_router(deps: TelegramDependencies) -> Router:
@@ -75,6 +94,109 @@ def build_router(deps: TelegramDependencies) -> Router:
             f"chat_id: <code>{message.chat.id}</code>\nuser_id: <code>{user_id}</code>\n"
             "После настройки выключите SETUP_MODE."
         )
+
+    @router.message(F.text.regexp(r"^/(?:setup|настроить)(?:@\w+)?$"))
+    async def setup_group(message: Message) -> None:
+        if not deps.settings.setup_mode or message.from_user is None:
+            return
+        if message.chat.type not in {"group", "supergroup"}:
+            await message.reply(
+                "Добавьте бота в семейную группу и отправьте <code>/setup</code> там."
+            )
+            return
+        owner_id = deps.settings.telegram_owner_user_id
+        if owner_id is None or message.from_user.id != owner_id:
+            await message.reply("Первичную настройку может запустить только владелец.")
+            return
+        async with deps.session_factory() as session, session.begin():
+            household = await seed_household(
+                session,
+                deps.settings,
+                message.chat.id,
+                owner_id,
+            )
+            await get_current_cycle(
+                session,
+                household,
+                datetime.now(deps.settings.timezone).date(),
+                deps.settings.financial_cycle_start_day,
+            )
+        await message.reply(
+            "✅ <b>Семейная группа подключена.</b>\n"
+            "Пусть жена отправит здесь <code>/join</code>. \n"
+            "Затем можно присылать чеки, голосовые или писать расходы текстом."
+        )
+
+    @router.message(F.text.regexp(r"^/(?:join|войти)(?:@\w+)?$"))
+    async def join_household(message: Message) -> None:
+        if not deps.settings.setup_mode or message.from_user is None:
+            return
+        household = None
+        async with deps.session_factory() as session, session.begin():
+            household = await get_household_by_chat(session, message.chat.id)
+            if household is None:
+                await message.reply(
+                    "Сначала владелец должен отправить в группе <code>/setup</code>."
+                )
+                return
+            existing = await session.scalar(
+                select(Member).where(
+                    Member.household_id == household.id,
+                    Member.telegram_user_id == message.from_user.id,
+                )
+            )
+            if existing is not None:
+                existing.active = True
+                response = "✅ Вы уже подключены к семейному бюджету."
+            else:
+                member_count = int(
+                    await session.scalar(
+                        select(func.count(Member.id)).where(
+                            Member.household_id == household.id,
+                            Member.active.is_(True),
+                        )
+                    )
+                    or 0
+                )
+                if member_count >= 2:
+                    await message.reply("В семейном бюджете уже есть два участника.")
+                    return
+                session.add(
+                    Member(
+                        household_id=household.id,
+                        telegram_user_id=message.from_user.id,
+                        role="member",
+                        display_name=message.from_user.full_name[:120],
+                    )
+                )
+                response = "✅ Вы подключены к семейному бюджету."
+        await message.reply(response)
+
+    @router.message(F.voice)
+    async def voice_expense(message: Message) -> None:
+        authorization = await authorize_message(message, deps)
+        if authorization is None or message.voice is None:
+            return
+        household, user_id = authorization
+        if message.voice.duration > deps.settings.telegram_voice_max_seconds:
+            await message.reply(
+                f"Голосовое слишком длинное. Максимум — "
+                f"{deps.settings.telegram_voice_max_seconds} секунд."
+            )
+            return
+        progress = await message.reply("🎙 Голосовое принял, расшифровываю…")
+        try:
+            stream = BytesIO()
+            await message.bot.download(message.voice.file_id, destination=stream)
+            transcript = await deps.expense_interpreter.transcribe(
+                stream.getvalue(),
+                filename="voice.ogg",
+                mime_type=message.voice.mime_type or "audio/ogg",
+            )
+            await progress.edit_text(f"📝 Распознал: <i>{escape(transcript)}</i>")
+            await handle_natural_operation(message, deps, household, user_id, transcript)
+        except Exception as exc:
+            await message.reply(f"❌ Не удалось обработать голосовое: {escape(str(exc))}")
 
     @router.message(F.photo | F.document)
     async def receipt_upload(message: Message) -> None:
@@ -275,13 +397,24 @@ def build_router(deps: TelegramDependencies) -> Router:
 
     @router.message(F.text.regexp(r"^/(?:help|помощь)(?:@\w+)?$|^помощь$|^/start"))
     async def help_message(message: Message) -> None:
-        authorization = await authorize_message(message, deps)
+        authorization = await authorize_message(message, deps, notify=False)
         if authorization is None and not deps.settings.setup_mode:
+            return
+        if authorization is None:
+            await message.answer(
+                "👋 Бот работает.\n\n"
+                "1. Добавьте его в семейную Telegram-группу.\n"
+                "2. Владелец отправляет в группе <code>/setup</code>.\n"
+                "3. Второй взрослый отправляет <code>/join</code>."
+            )
             return
         await message.answer(
             "<b>Как пользоваться</b>\n"
             "• Пришлите фотографию чека.\n"
+            "• Или наговорите расход голосом.\n"
             "• <code>такси 180 бат</code> — ручной расход.\n"
+            "• <code>в 7-Eleven купил колу за 35 бат</code> — расход свободной фразой.\n"
+            "• <code>нет, это было молоко</code> — исправление последнего расхода.\n"
             "• <code>кафе 500000 донгов</code> — расход в другой валюте.\n"
             "• <code>получена зарплата 840000 тенге</code> — доход.\n"
             "• <code>отложил 600000 тенге на машину</code> — накопление.\n"
@@ -441,86 +574,7 @@ def build_router(deps: TelegramDependencies) -> Router:
         if authorization is None or not message.text:
             return
         household, user_id = authorization
-        intent = parse_text_intent(message.text)
-        if intent is None:
-            return
-        local_now = datetime.now(deps.settings.timezone)
-        try:
-            async with deps.session_factory() as session, session.begin():
-                cycle = await get_current_cycle(
-                    session,
-                    household,
-                    local_now.date(),
-                    deps.settings.financial_cycle_start_day,
-                )
-                if intent.kind == "expense" and intent.category_key:
-                    category = await get_category(session, household.id, intent.category_key)
-                    posted = await post_expense(
-                        session,
-                        deps.rate_service,
-                        household,
-                        cycle,
-                        category,
-                        intent.amount,
-                        intent.currency,
-                        intent.description,
-                        local_now,
-                        user_id,
-                    )
-                    response = (
-                        f"✅ {category.icon} {category.name}: {format_money(intent.amount)} "
-                        f"{intent.currency} · {format_money(posted.entry.amount_kzt)} ₸"
-                    )
-                elif intent.kind == "income":
-                    posted = await post_income(
-                        session,
-                        deps.rate_service,
-                        household,
-                        cycle,
-                        intent.amount,
-                        intent.currency,
-                        intent.description,
-                        local_now,
-                        user_id,
-                    )
-                    response = f"✅ Доход: {format_money(posted.entry.amount_kzt)} ₸"
-                elif intent.kind == "goal" and intent.goal_key:
-                    posted = await post_goal_contribution(
-                        session,
-                        deps.rate_service,
-                        household,
-                        cycle,
-                        intent.goal_key,
-                        intent.amount,
-                        intent.currency,
-                        local_now,
-                        user_id,
-                    )
-                    response = f"✅ В накопления: {format_money(posted.entry.amount_kzt)} ₸"
-                elif intent.kind == "goal_expense" and intent.goal_key:
-                    posted = await post_goal_expense(
-                        session,
-                        deps.rate_service,
-                        household,
-                        cycle,
-                        intent.goal_key,
-                        intent.amount,
-                        intent.currency,
-                        intent.description,
-                        local_now,
-                        user_id,
-                    )
-                    response = f"✅ Из фонда списано: {format_money(posted.entry.amount_kzt)} ₸"
-                else:
-                    return
-            await message.reply(response)
-        except RateUnavailableError:
-            await message.reply(
-                "Не нашёл официальный курс. Операция не проведена. Владелец может задать "
-                "курс: <code>/rate XXX курс_к_тенге номинал</code>."
-            )
-        except (CurrencyError, InvalidOperation, ValueError) as exc:
-            await message.reply(f"Не удалось провести операцию: {escape(str(exc))}")
+        await handle_natural_operation(message, deps, household, user_id, message.text)
 
     @router.callback_query(F.data.startswith("cycle:"))
     async def cycle_callback(callback: CallbackQuery) -> None:
@@ -655,7 +709,10 @@ def build_router(deps: TelegramDependencies) -> Router:
                         f"{index}. {escape(item.raw_name)} — {format_money(item.line_total)}"
                     )
                 lines.append(
-                    f"\nДля исправления отправьте:\n<code>/fix {receipt.id} номер мясо</code>"
+                    "\nОтветьте текстом или голосом, например:\n"
+                    "<i>«нет, позиция 2 — молоко»</i>\n\n"
+                    f"Или точно смените категорию:\n"
+                    f"<code>/fix {receipt.id} номер мясо</code>"
                 )
                 await callback.answer()
                 await callback.message.reply("\n".join(lines))
@@ -663,23 +720,466 @@ def build_router(deps: TelegramDependencies) -> Router:
     return router
 
 
+def is_correction_text(text: str) -> bool:
+    normalized = " ".join(text.casefold().split())
+    return any(marker in normalized for marker in CORRECTION_MARKERS)
+
+
+async def handle_natural_operation(
+    message: Message,
+    deps: TelegramDependencies,
+    household: Household,
+    user_id: int,
+    text: str,
+) -> None:
+    if is_correction_text(text):
+        await correct_last_expense(message, deps, household, user_id, text)
+        return
+
+    intent = parse_text_intent(text)
+    local_now = datetime.now(deps.settings.timezone)
+    try:
+        if intent is not None:
+            async with deps.session_factory() as session, session.begin():
+                cycle = await get_current_cycle(
+                    session,
+                    household,
+                    local_now.date(),
+                    deps.settings.financial_cycle_start_day,
+                )
+                if intent.kind == "expense" and intent.category_key:
+                    category = await get_category(session, household.id, intent.category_key)
+                    posted = await post_expense(
+                        session,
+                        deps.rate_service,
+                        household,
+                        cycle,
+                        category,
+                        intent.amount,
+                        intent.currency,
+                        intent.description,
+                        local_now,
+                        user_id,
+                    )
+                    response = await build_expense_response(
+                        session, cycle.id, [(posted, category)]
+                    )
+                elif intent.kind == "income":
+                    posted = await post_income(
+                        session,
+                        deps.rate_service,
+                        household,
+                        cycle,
+                        intent.amount,
+                        intent.currency,
+                        intent.description,
+                        local_now,
+                        user_id,
+                    )
+                    response = f"✅ Доход: {format_money(posted.entry.amount_kzt)} ₸"
+                elif intent.kind == "goal" and intent.goal_key:
+                    posted = await post_goal_contribution(
+                        session,
+                        deps.rate_service,
+                        household,
+                        cycle,
+                        intent.goal_key,
+                        intent.amount,
+                        intent.currency,
+                        local_now,
+                        user_id,
+                    )
+                    response = f"✅ В накопления: {format_money(posted.entry.amount_kzt)} ₸"
+                elif intent.kind == "goal_expense" and intent.goal_key:
+                    posted = await post_goal_expense(
+                        session,
+                        deps.rate_service,
+                        household,
+                        cycle,
+                        intent.goal_key,
+                        intent.amount,
+                        intent.currency,
+                        intent.description,
+                        local_now,
+                        user_id,
+                    )
+                    response = f"✅ Из фонда списано: {format_money(posted.entry.amount_kzt)} ₸"
+                else:
+                    return
+            await message.reply(response)
+            return
+
+        async with deps.session_factory() as session:
+            category_models = (
+                await session.scalars(
+                    select(Category).where(
+                        Category.household_id == household.id,
+                        Category.active.is_(True),
+                    )
+                )
+            ).all()
+        categories = {category.key: category.name for category in category_models}
+        category_by_key = {category.key: category for category in category_models}
+        interpretation = await deps.expense_interpreter.interpret(text, categories)
+        if interpretation.kind == "correction":
+            await correct_last_expense(
+                message,
+                deps,
+                household,
+                user_id,
+                text,
+                interpretation=interpretation,
+            )
+            return
+        if interpretation.kind != "expense" or not interpretation.items:
+            await message.reply(
+                "Не понял расход. Напишите или скажите, что купили, сумму и валюту."
+            )
+            return
+
+        async with deps.session_factory() as session, session.begin():
+            cycle = await get_current_cycle(
+                session,
+                household,
+                local_now.date(),
+                deps.settings.financial_cycle_start_day,
+            )
+            posted_items: list[tuple[PostedEntry, Category]] = []
+            for item in interpretation.items:
+                if (
+                    item.amount is None
+                    or item.currency is None
+                    or item.category_key not in category_by_key
+                    or not item.description
+                ):
+                    raise ValueError(
+                        "Не хватает товара, суммы, валюты или категории"
+                    )
+                category = category_by_key[item.category_key]
+                posted = await post_expense(
+                    session,
+                    deps.rate_service,
+                    household,
+                    cycle,
+                    category,
+                    Decimal(str(item.amount)),
+                    normalize_currency(item.currency),
+                    item.description,
+                    local_now,
+                    user_id,
+                )
+                posted_items.append((posted, category))
+            response = await build_expense_response(session, cycle.id, posted_items)
+        await message.reply(response)
+    except RateUnavailableError:
+        await message.reply(
+            "Не нашёл официальный курс. Операция не проведена. Владелец может задать "
+            "курс: <code>/rate XXX курс_к_тенге номинал</code>."
+        )
+    except (CurrencyError, InvalidOperation, ValueError) as exc:
+        await message.reply(f"Не удалось провести операцию: {escape(str(exc))}")
+    except Exception:
+        await message.reply("❌ Нейросеть не смогла разобрать сообщение. Операция не проведена.")
+
+
+async def build_expense_response(
+    session: AsyncSession,
+    cycle_id: str,
+    posted_items: list[tuple[PostedEntry, Category]],
+) -> str:
+    remaining_by_category = {
+        category.id: (limit - spent, category.envelope_currency)
+        for category, limit, spent in await allocation_and_spend(session, cycle_id)
+    }
+    lines = ["✅ <b>Расход записан</b>"]
+    for posted, category in posted_items:
+        entry = posted.entry
+        rate = posted.source_rate.rate_kzt / posted.source_rate.nominal
+        remaining, envelope_currency = remaining_by_category.get(
+            category.id, (Decimal("0"), category.envelope_currency)
+        )
+        lines.append(
+            f"• {escape(entry.description)}: {format_money(entry.original_amount)} "
+            f"{entry.original_currency} → <b>{format_money(entry.amount_kzt)} ₸</b>"
+        )
+        if entry.original_currency != "KZT":
+            lines.append(
+                f"  Курс: 1 {entry.original_currency} = {format_money(rate)} ₸"
+            )
+        lines.append(
+            f"  {category.icon} {category.name} · осталось "
+            f"<b>{format_money(remaining)} {envelope_currency}</b>"
+        )
+    lines.append("Если что-то неверно, напишите или скажите: <i>«нет, это было молоко»</i>.")
+    return "\n".join(lines)
+
+
+async def correct_last_expense(
+    message: Message,
+    deps: TelegramDependencies,
+    household: Household,
+    user_id: int,
+    text: str,
+    interpretation: ExpenseInterpretation | None = None,
+) -> None:
+    async with deps.session_factory() as session:
+        last_entry = await session.scalar(
+            select(LedgerEntry)
+            .where(
+                LedgerEntry.household_id == household.id,
+                LedgerEntry.created_by_user_id == user_id,
+                LedgerEntry.entry_type == "expense",
+                LedgerEntry.status == "posted",
+            )
+            .order_by(LedgerEntry.created_at.desc())
+            .limit(1)
+        )
+        if last_entry is None:
+            await message.reply("Не нашёл ваш последний расход для исправления.")
+            return
+        category_models = (
+            await session.scalars(
+                select(Category).where(
+                    Category.household_id == household.id,
+                    Category.active.is_(True),
+                )
+            )
+        ).all()
+        previous_category = await session.get(Category, last_entry.category_id)
+        receipt = None
+        receipt_items: list[ReceiptItem] = []
+        if last_entry.receipt_id:
+            receipt = await session.scalar(
+                select(Receipt)
+                .where(Receipt.id == last_entry.receipt_id)
+                .options(selectinload(Receipt.items))
+            )
+            if receipt is not None:
+                receipt_items = sorted(receipt.items, key=lambda item: item.created_at)
+
+    if receipt_items:
+        item_context = "; ".join(
+            f"{index}. {item.raw_name}, {format_money(item.line_total)} "
+            f"{receipt.original_currency if receipt else ''}"
+            for index, item in enumerate(receipt_items, 1)
+        )
+        previous_context = f"Чек: {item_context}"
+    else:
+        previous_context = (
+            f"Расход: {last_entry.description}; {last_entry.original_amount} "
+            f"{last_entry.original_currency}; категория "
+            f"{previous_category.key if previous_category else 'unknown'}"
+        )
+    categories = {category.key: category.name for category in category_models}
+    interpretation = interpretation or await deps.expense_interpreter.interpret(
+        text, categories, previous_context
+    )
+    if interpretation.kind != "correction" or not interpretation.items:
+        await message.reply(
+            "Не понял, что именно исправить. Например: <i>«нет, это было молоко»</i>."
+        )
+        return
+    correction = interpretation.items[0]
+    category_by_key = {category.key: category for category in category_models}
+
+    try:
+        async with deps.session_factory() as session, session.begin():
+            locked_entry = await session.scalar(
+                select(LedgerEntry).where(LedgerEntry.id == last_entry.id).with_for_update()
+            )
+            if locked_entry is None or locked_entry.status != "posted":
+                await message.reply("Расход уже изменён или удалён.")
+                return
+            if locked_entry.receipt_id:
+                locked_receipt = await session.scalar(
+                    select(Receipt)
+                    .where(Receipt.id == locked_entry.receipt_id)
+                    .options(selectinload(Receipt.items))
+                    .with_for_update()
+                )
+                if locked_receipt is None:
+                    raise ValueError("Чек не найден")
+                items = sorted(locked_receipt.items, key=lambda item: item.created_at)
+                target_number = correction.target_item_number
+                if len(items) > 1 and target_number is None:
+                    await message.reply(
+                        "В чеке несколько позиций. Укажите номер, например: "
+                        "<i>«нет, позиция 2 — молоко»</i>."
+                    )
+                    return
+                target_number = target_number or 1
+                if not 1 <= target_number <= len(items):
+                    raise ValueError("Неверный номер позиции чека")
+                target = items[target_number - 1]
+                before = {
+                    "raw_name": target.raw_name,
+                    "line_total": str(target.line_total),
+                    "category_id": target.category_id,
+                }
+                if correction.description:
+                    target.raw_name = correction.description[:500]
+                if correction.amount is not None:
+                    target.line_total = quantize(Decimal(str(correction.amount)))
+                if correction.currency and len(items) > 1:
+                    raise ValueError("Валюту можно менять только у чека с одной позицией")
+                currency = normalize_currency(
+                    correction.currency or locked_receipt.original_currency or "KZT"
+                )
+                if correction.category_key:
+                    corrected_category = category_by_key.get(correction.category_key)
+                    if corrected_category is None:
+                        raise ValueError("Категория не найдена")
+                    target.category_id = corrected_category.id
+                    target.subcategory_id = None
+                occurred_at = locked_receipt.purchased_at or locked_receipt.created_at
+                local_date = occurred_at.astimezone(deps.settings.timezone).date()
+                source_rate = await deps.rate_service.get_quote(session, currency, local_date)
+                for item in items:
+                    item_category = await session.get(Category, item.category_id)
+                    if item_category is None:
+                        raise ValueError("Категория позиции не найдена")
+                    item.amount_kzt = source_rate.to_kzt(Decimal(item.line_total))
+                    envelope_rate = await deps.rate_service.get_quote(
+                        session, item_category.envelope_currency, local_date
+                    )
+                    item.envelope_amount = envelope_rate.from_kzt(item.amount_kzt)
+                    item.envelope_currency = item_category.envelope_currency
+                locked_receipt.original_currency = currency
+                locked_receipt.original_total = quantize(
+                    sum((Decimal(item.line_total) for item in items), Decimal("0"))
+                )
+                locked_receipt.total_kzt = source_rate.to_kzt(locked_receipt.original_total)
+                locked_receipt.exchange_rate_id = source_rate.rate_id
+                await rebuild_receipt_ledger(session, household, locked_receipt, user_id)
+                session.add(
+                    AuditLog(
+                        household_id=household.id,
+                        actor_user_id=user_id,
+                        action="receipt_item_natural_correction",
+                        entity_type="receipt_item",
+                        entity_id=target.id,
+                        before_data=before,
+                        after_data={
+                            "raw_name": target.raw_name,
+                            "line_total": str(target.line_total),
+                            "category_id": target.category_id,
+                        },
+                    )
+                )
+                corrected_category = await session.get(Category, target.category_id)
+                response = (
+                    f"✅ Исправил позицию {target_number}: "
+                    f"<b>{escape(target.raw_name)}</b> — {format_money(target.line_total)} "
+                    f"{currency} → {corrected_category.icon if corrected_category else ''} "
+                    f"{corrected_category.name if corrected_category else 'категория'}.\n"
+                    f"Новый итог чека: <b>{format_money(locked_receipt.original_total)} "
+                    f"{currency}</b> · {format_money(locked_receipt.total_kzt)} ₸"
+                )
+            else:
+                category = (
+                    category_by_key.get(correction.category_key)
+                    if correction.category_key
+                    else await session.get(Category, locked_entry.category_id)
+                )
+                if category is None:
+                    raise ValueError("Категория не найдена")
+                cycle = await session.get_one(BudgetCycle, locked_entry.cycle_id)
+                locked_entry.status = "reversed"
+                new_posted = await post_expense(
+                    session,
+                    deps.rate_service,
+                    household,
+                    cycle,
+                    category,
+                    Decimal(str(correction.amount))
+                    if correction.amount is not None
+                    else Decimal(locked_entry.original_amount),
+                    normalize_currency(correction.currency or locked_entry.original_currency),
+                    correction.description or locked_entry.description,
+                    locked_entry.occurred_at.astimezone(deps.settings.timezone),
+                    user_id,
+                )
+                new_posted.entry.reversal_of_id = locked_entry.id
+                session.add(
+                    AuditLog(
+                        household_id=household.id,
+                        actor_user_id=user_id,
+                        action="ledger_expense_natural_correction",
+                        entity_type="ledger_entry",
+                        entity_id=new_posted.entry.id,
+                        before_data={
+                            "entry_id": locked_entry.id,
+                            "description": locked_entry.description,
+                            "amount": str(locked_entry.original_amount),
+                            "currency": locked_entry.original_currency,
+                            "category_id": locked_entry.category_id,
+                        },
+                        after_data={
+                            "description": new_posted.entry.description,
+                            "amount": str(new_posted.entry.original_amount),
+                            "currency": new_posted.entry.original_currency,
+                            "category_id": category.id,
+                        },
+                    )
+                )
+                response = await build_expense_response(
+                    session, cycle.id, [(new_posted, category)]
+                )
+        await message.reply(response)
+    except RateUnavailableError:
+        await message.reply("Не удалось исправить: нет актуального курса валюты.")
+    except (CurrencyError, InvalidOperation, ValueError) as exc:
+        await message.reply(f"Не удалось исправить расход: {escape(str(exc))}")
+
+
 async def authorize_message(
     message: Message,
     deps: TelegramDependencies,
     owner_only: bool = False,
+    notify: bool = True,
 ) -> tuple[Household, int] | None:
     if message.from_user is None:
         return None
-    if deps.settings.telegram_allowed_chat_id != message.chat.id:
-        return None
     user_id = message.from_user.id
-    if user_id not in deps.settings.allowed_user_ids:
-        return None
-    if owner_only and user_id != deps.settings.telegram_owner_user_id:
-        return None
     async with deps.session_factory() as session:
-        household = await get_household_by_chat(session, message.chat.id)
+        if message.chat.type == "private":
+            row = (
+                await session.execute(
+                    select(Household, Member)
+                    .join(Member, Member.household_id == Household.id)
+                    .where(
+                        Household.active.is_(True),
+                        Member.telegram_user_id == user_id,
+                        Member.active.is_(True),
+                    )
+                    .order_by(Member.created_at)
+                    .limit(1)
+                )
+            ).first()
+            household, member = row if row is not None else (None, None)
+        else:
+            household = await get_household_by_chat(session, message.chat.id)
+            member = None
+            if household is not None:
+                member = await session.scalar(
+                    select(Member).where(
+                        Member.household_id == household.id,
+                        Member.telegram_user_id == user_id,
+                        Member.active.is_(True),
+                    )
+                )
         if household is None:
+            if notify:
+                await message.reply(
+                    "Бюджет ещё не привязан. Добавьте бота в семейную группу и "
+                    "отправьте там <code>/setup</code>."
+                )
+            return None
+        if member is None:
+            await message.reply("Вы не подключены к этому семейному бюджету.")
+            return None
+        if owner_only and member.role != "owner":
+            await message.reply("Эта команда доступна только владельцу бюджета.")
             return None
         return household, user_id
 
@@ -687,10 +1187,18 @@ async def authorize_message(
 async def authorize_callback(callback: CallbackQuery, deps: TelegramDependencies) -> bool:
     if callback.message is None:
         return False
-    return (
-        callback.message.chat.id == deps.settings.telegram_allowed_chat_id
-        and callback.from_user.id in deps.settings.allowed_user_ids
-    )
+    async with deps.session_factory() as session:
+        household = await get_household_by_chat(session, callback.message.chat.id)
+        if household is None:
+            return False
+        member = await session.scalar(
+            select(Member).where(
+                Member.household_id == household.id,
+                Member.telegram_user_id == callback.from_user.id,
+                Member.active.is_(True),
+            )
+        )
+        return member is not None
 
 
 async def pending_receipt_count(session: AsyncSession, cycle_id: str) -> int:

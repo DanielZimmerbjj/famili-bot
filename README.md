@@ -14,6 +14,8 @@
 - официальный текущий/исторический курс НБК, включая номинал `1000 VND`;
 - оригинальная сумма, KZT-эквивалент и влияние на THB-конверт сохраняются отдельно;
 - ручные расходы, зарплаты и пополнения целей обычным текстом;
+- голосовые расходы с OpenAI transcription и классификацией;
+- исправление последнего расхода или позиции чека текстом/голосом;
 - цель «Автомобиль» 1 200 000 KZT;
 - фонд бордеррана 300 000 KZT с месячным взносом 50 000 KZT;
 - ежедневный отчет в 23:00 `Asia/Bangkok`;
@@ -38,22 +40,25 @@ alembic upgrade head
 uvicorn family_bot.main:app --reload --port 8000
 ```
 
-Для локального HTTPS webhook используйте отдельный tunnel/domain. Production использует webhook; long polling намеренно не включен.
+Production по умолчанию использует long polling. Webhook оставлен как
+опциональный режим `TELEGRAM_DELIVERY_MODE=webhook`.
 
 ## Первый запуск Telegram
 
 1. Перевыпустите ранее опубликованный bot token через BotFather.
 2. В BotFather отключите Group Privacy (`/setprivacy → Disable`).
 3. После изменения privacy удалите и снова добавьте бота в семейную группу.
-4. Временно установите `SETUP_MODE=true`.
-5. Напишите в группе `/ids` и получите `chat_id` и свой `user_id`.
-6. Запишите `TELEGRAM_ALLOWED_CHAT_ID`, `TELEGRAM_OWNER_USER_ID` и `TELEGRAM_MEMBER_USER_ID` в environment.
-7. Установите `SETUP_MODE=false` и перезапустите приложение.
+4. Временно установите `SETUP_MODE=true` и `TELEGRAM_OWNER_USER_ID`.
+5. Владелец пишет в семейной группе `/setup`.
+6. Второй взрослый пишет в той же группе `/join`.
+7. После двух участников можно установить `SETUP_MODE=false`.
 
 ## Сообщения
 
 ```text
 такси 180 бат
+в 7-Eleven купил Coca-Cola за 35 бат
+нет, это было молоко за те же деньги
 кафе 500000 донгов
 получена зарплата 840000 тенге
 отложил 600000 тенге на машину
@@ -95,11 +100,13 @@ Deployment в этой версии не выполняется автомати
 1. Создайте PostgreSQL resource и приложение из GitHub-репозитория.
 2. Выберите build из `Dockerfile`, expose port `8000`.
 3. Подключите постоянный volume к `/data/receipts`.
-4. Добавьте новый HTTPS-домен и установите `TELEGRAM_WEBHOOK_URL=https://domain/telegram/webhook`.
+4. Установите `TELEGRAM_DELIVERY_MODE=polling`; HTTPS-домен нужен для healthcheck,
+   но не для доставки Telegram.
 5. Добавьте все значения из `.env.example` через Coolify Environment Variables.
 6. Используйте внутренний PostgreSQL URL вида `postgresql+asyncpg://...`.
 7. Установите healthcheck path `/health/ready`.
 8. Оставьте одну replica: scheduler защищен на уровне записей БД, но MVP рассчитан на один процесс.
-9. После запуска проверьте `/health/live`, `/health/ready`, `getWebhookInfo`, тестовый расход и вечерний отчет.
+9. После запуска проверьте `/health/live`, `/health/ready`, лог `Telegram long polling
+   started`, `/start`, тестовый расход и вечерний отчет.
 
 Миграции Alembic выполняются контейнером перед запуском Uvicorn. Секреты должны находиться только в Coolify Environment Variables.
