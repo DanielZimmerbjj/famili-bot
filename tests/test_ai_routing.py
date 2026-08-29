@@ -4,9 +4,10 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from family_bot.config import Settings
-from family_bot.models import Base, LedgerEntry
+from family_bot.models import Base, LedgerEntry, SavingsGoal
 from family_bot.services.cycles import seed_household
 from family_bot.services.expense_ai import ExpenseInterpretation, InterpretedExpenseItem
+from family_bot.services.ledger import goal_balance
 from family_bot.services.rates import RateService
 from family_bot.telegram.handlers import handle_natural_operation
 
@@ -15,7 +16,7 @@ class FakeMessage:
     def __init__(self) -> None:
         self.replies: list[str] = []
 
-    async def reply(self, text: str) -> None:
+    async def reply(self, text: str, **kwargs: object) -> None:
         self.replies.append(text)
 
 
@@ -107,4 +108,53 @@ async def test_non_financial_text_is_not_posted() -> None:
     assert message.replies and "Ничего не записал" in message.replies[0]
     async with factory() as session:
         assert await session.scalar(select(func.count(LedgerEntry.id))) == 0
+    await engine.dispose()
+
+
+async def test_ai_creates_dynamic_goal_with_target_and_contribution() -> None:
+    engine, factory, household, settings = await make_budget()
+    interpreter = FakeInterpreter(
+        ExpenseInterpretation(
+            kind="goal_contribution",
+            items=[
+                InterpretedExpenseItem(
+                    description="Начинаю копить на ноутбук",
+                    amount=300000,
+                    currency="KZT",
+                    goal_name="Ноутбук",
+                    target_amount=1000000,
+                    target_currency="KZT",
+                    confidence=0.99,
+                )
+            ],
+            overall_confidence=0.99,
+        )
+    )
+    deps = SimpleNamespace(
+        settings=settings,
+        session_factory=factory,
+        rate_service=RateService(),
+        expense_interpreter=interpreter,
+    )
+    message = FakeMessage()
+
+    await handle_natural_operation(
+        message,
+        deps,
+        household,
+        42,
+        "ноутбук стоит миллион, отложил 300 тысяч тенге",
+    )
+
+    async with factory() as session:
+        goal = await session.scalar(
+            select(SavingsGoal).where(
+                SavingsGoal.household_id == household.id,
+                SavingsGoal.name == "Ноутбук",
+            )
+        )
+        assert goal is not None
+        assert goal.target_amount == 1000000
+        assert await goal_balance(session, household.id, goal.id) == 300000
+    assert message.replies and "осталось 700 000" in message.replies[0]
     await engine.dispose()

@@ -3,8 +3,9 @@ from __future__ import annotations
 import re
 from collections import defaultdict
 from dataclasses import dataclass
-from datetime import UTC, datetime, time
+from datetime import UTC, date, datetime, time
 from decimal import Decimal, InvalidOperation
+from hashlib import sha256
 from html import escape
 from io import BytesIO
 
@@ -34,7 +35,11 @@ from family_bot.services.cycles import (
     get_household_by_chat,
     seed_household,
 )
-from family_bot.services.expense_ai import ExpenseInterpretation, ExpenseInterpreter
+from family_bot.services.expense_ai import (
+    ExpenseInterpretation,
+    ExpenseInterpreter,
+    InterpretedExpenseItem,
+)
 from family_bot.services.ledger import (
     PostedEntry,
     allocation_and_spend,
@@ -51,7 +56,7 @@ from family_bot.services.rates import RateService, RateUnavailableError
 from family_bot.services.receipts import ReceiptService, format_money
 from family_bot.services.reports import build_chart, build_report
 from family_bot.services.text_parser import match_category
-from family_bot.telegram.keyboards import cycle_close_keyboard
+from family_bot.telegram.keyboards import cycle_close_keyboard, main_menu_keyboard
 
 FIX_RE = re.compile(
     r"^/(?:fix|исправить)\s+(?P<receipt>[0-9a-f-]{36})\s+(?P<item>\d+)\s+(?P<category>.+)$",
@@ -85,13 +90,30 @@ IDS_COMMAND_RE = simple_command_pattern("ids", "айди")
 SETUP_COMMAND_RE = simple_command_pattern("setup", "настроить")
 JOIN_COMMAND_RE = simple_command_pattern("join", "войти")
 BALANCE_COMMAND_RE = simple_command_pattern(
-    "balance", "report", "остаток", "отчет", plain=("остаток", "отчет")
+    "balance",
+    "report",
+    "остаток",
+    "отчет",
+    plain=("остаток", "отчет", "💰 Баланс"),
 )
-TODAY_COMMAND_RE = simple_command_pattern("today", "сегодня", plain=("сегодня",))
-INCOME_COMMAND_RE = simple_command_pattern("income", "доходы", plain=("доходы",))
-CHART_COMMAND_RE = simple_command_pattern("chart", "график", plain=("график",))
-GOAL_COMMAND_RE = simple_command_pattern("goal", "goals", "цель", plain=("цель",))
-HELP_COMMAND_RE = simple_command_pattern("start", "help", "помощь", plain=("помощь",))
+TODAY_COMMAND_RE = simple_command_pattern(
+    "today", "сегодня", plain=("сегодня", "🧾 Сегодня")
+)
+INCOME_COMMAND_RE = simple_command_pattern(
+    "income", "доходы", plain=("доходы", "💵 Доходы")
+)
+CHART_COMMAND_RE = simple_command_pattern(
+    "chart", "график", plain=("график", "📊 График")
+)
+GOAL_COMMAND_RE = simple_command_pattern(
+    "goal",
+    "goals",
+    "цель",
+    plain=("цель", "накопления", "🎯 Накопления"),
+)
+HELP_COMMAND_RE = simple_command_pattern(
+    "start", "help", "помощь", plain=("помощь", "❓ Помощь")
+)
 CLOSE_COMMAND_RE = simple_command_pattern("close", "rollover", "закрыть")
 
 
@@ -146,7 +168,8 @@ def build_router(deps: TelegramDependencies) -> Router:
         await message.reply(
             "✅ <b>Семейная группа подключена.</b>\n"
             "Теперь любой участник группы может присылать чеки, голосовые или "
-            "писать финансовые операции обычным текстом."
+            "писать финансовые операции обычным текстом.",
+            reply_markup=main_menu_keyboard(),
         )
 
     @router.message(F.text.regexp(JOIN_COMMAND_RE))
@@ -180,7 +203,7 @@ def build_router(deps: TelegramDependencies) -> Router:
                     )
                 )
                 response = "✅ Вы подключены к семейному бюджету."
-        await message.reply(response)
+        await message.reply(response, reply_markup=main_menu_keyboard())
 
     @router.message(F.voice)
     async def voice_expense(message: Message) -> None:
@@ -270,7 +293,7 @@ def build_router(deps: TelegramDependencies) -> Router:
                 session, deps.rate_service, household, cycle, local_now.date()
             )
             await session.commit()
-        await message.answer(report)
+        await message.answer(report, reply_markup=main_menu_keyboard())
 
     @router.message(F.text.regexp(TODAY_COMMAND_RE))
     async def today(message: Message) -> None:
@@ -308,7 +331,10 @@ def build_router(deps: TelegramDependencies) -> Router:
             f"{entry.original_currency} · {format_money(entry.amount_kzt)} ₸"
             for entry in entries
         )
-        await message.answer("\n".join(lines) if entries else "Сегодня расходов пока нет.")
+        await message.answer(
+            "\n".join(lines) if entries else "Сегодня расходов пока нет.",
+            reply_markup=main_menu_keyboard(),
+        )
 
     @router.message(F.text.regexp(INCOME_COMMAND_RE))
     async def incomes(message: Message) -> None:
@@ -356,7 +382,7 @@ def build_router(deps: TelegramDependencies) -> Router:
                 f"{format_money(cycle.expected_income_kzt)} ₸</b>"
             )
             await session.commit()
-        await message.answer("\n".join(lines))
+        await message.answer("\n".join(lines), reply_markup=main_menu_keyboard())
 
     @router.message(F.text.regexp(CHART_COMMAND_RE))
     async def chart(message: Message) -> None:
@@ -377,6 +403,7 @@ def build_router(deps: TelegramDependencies) -> Router:
         await message.answer_photo(
             BufferedInputFile(payload, filename="family-budget.png"),
             caption="Лимиты и расходы текущего финансового месяца",
+            reply_markup=main_menu_keyboard(),
         )
 
     @router.message(F.text.regexp(GOAL_COMMAND_RE))
@@ -397,11 +424,19 @@ def build_router(deps: TelegramDependencies) -> Router:
             lines = ["<b>Накопления</b>"]
             for goal in goal_models:
                 value = await goal_balance(session, household.id, goal.id)
-                lines.append(
-                    f"{goal.icon} {goal.name}: {format_money(value)} / "
-                    f"{format_money(goal.target_amount)} {goal.currency}"
-                )
-        await message.answer("\n".join(lines))
+                if Decimal(goal.target_amount) > 0:
+                    remaining = max(Decimal(goal.target_amount) - value, Decimal("0"))
+                    lines.append(
+                        f"{goal.icon} {goal.name}: {format_money(value)} / "
+                        f"{format_money(goal.target_amount)} {goal.currency} · "
+                        f"осталось {format_money(remaining)} {goal.currency}"
+                    )
+                else:
+                    lines.append(
+                        f"{goal.icon} {goal.name}: накоплено {format_money(value)} "
+                        f"{goal.currency} · общая стоимость не задана"
+                    )
+        await message.answer("\n".join(lines), reply_markup=main_menu_keyboard())
 
     @router.message(F.text.regexp(HELP_COMMAND_RE))
     async def help_message(message: Message) -> None:
@@ -426,9 +461,11 @@ def build_router(deps: TelegramDependencies) -> Router:
             "• <code>кафе 500000 донгов</code> — расход в другой валюте.\n"
             "• <code>получена зарплата 840000 тенге</code> — доход.\n"
             "• <code>отложил 600000 тенге на машину</code> — накопление.\n"
+            "• <code>ноутбук стоит миллион, отложил 300000 тенге</code> — новая цель.\n"
             "• <code>отложил 50000 тенге на бордерран</code> — фонд.\n\n"
             "• <code>купил билет на бордерран 300000 тенге</code> — списание фонда.\n\n"
-            "Команды: /balance /today /income /chart /goal /close /help"
+            "Используйте кнопки внизу чата — слеш-команды запоминать не нужно.",
+            reply_markup=main_menu_keyboard(),
         )
 
     @router.message(F.text.regexp(CLOSE_COMMAND_RE))
@@ -757,7 +794,12 @@ async def handle_natural_operation(
             previous_context = await latest_expense_context(session, household.id, user_id)
         categories = {category.key: category.name for category in category_models}
         category_by_key = {category.key: category for category in category_models}
-        goals = {goal.key: goal.name for goal in goal_models}
+        goals = {
+            goal.key: (
+                f"{goal.name}; target={format_money(goal.target_amount)} {goal.currency}"
+            )
+            for goal in goal_models
+        }
         goal_by_key = {goal.key: goal for goal in goal_models}
         interpretation = await deps.expense_interpreter.interpret(
             text,
@@ -854,30 +896,56 @@ async def handle_natural_operation(
                         f"{f' · {escape(source.name)}' if source else ''}"
                     )
                 response = "\n".join(lines)
-            elif interpretation.kind in {"goal_contribution", "goal_expense"}:
+            elif interpretation.kind in {
+                "goal_contribution",
+                "goal_expense",
+                "goal_target",
+            }:
                 heading = (
                     "✅ <b>Добавлено в накопления</b>"
                     if interpretation.kind == "goal_contribution"
-                    else "✅ <b>Списано из накоплений</b>"
+                    else (
+                        "✅ <b>Списано из накоплений</b>"
+                        if interpretation.kind == "goal_expense"
+                        else "✅ <b>Цель обновлена</b>"
+                    )
                 )
                 lines = [heading]
                 for item in interpretation.items:
-                    if (
-                        item.amount is None
-                        or item.currency is None
-                        or item.goal_key not in goal_by_key
-                    ):
-                        raise ValueError("не хватает цели, суммы или валюты")
+                    goal = await resolve_savings_goal(
+                        session,
+                        deps.rate_service,
+                        household,
+                        item,
+                        goal_by_key,
+                        local_now.date(),
+                    )
+                    if interpretation.kind == "goal_target":
+                        if item.target_amount is None:
+                            raise ValueError("не хватает общей стоимости цели")
+                        balance = await goal_balance(session, household.id, goal.id)
+                        remaining = max(
+                            Decimal(goal.target_amount) - balance,
+                            Decimal("0"),
+                        )
+                        lines.append(
+                            f"• {goal.icon} {escape(goal.name)}: "
+                            f"{format_money(balance)} / "
+                            f"<b>{format_money(goal.target_amount)} ₸</b> · "
+                            f"осталось {format_money(remaining)} ₸"
+                        )
+                        continue
+                    if item.amount is None or item.currency is None:
+                        raise ValueError("не хватает суммы или валюты")
                     amount = Decimal(str(item.amount))
                     currency = normalize_currency(item.currency)
-                    goal = goal_by_key[item.goal_key]
                     if interpretation.kind == "goal_contribution":
                         posted = await post_goal_contribution(
                             session,
                             deps.rate_service,
                             household,
                             cycle,
-                            item.goal_key,
+                            goal.key,
                             amount,
                             currency,
                             local_now,
@@ -889,7 +957,7 @@ async def handle_natural_operation(
                             deps.rate_service,
                             household,
                             cycle,
-                            item.goal_key,
+                            goal.key,
                             amount,
                             currency,
                             item.description or f"Расход из цели «{goal.name}»",
@@ -897,17 +965,29 @@ async def handle_natural_operation(
                             user_id,
                         )
                     balance = await goal_balance(session, household.id, goal.id)
+                    target = Decimal(goal.target_amount)
+                    if target > 0:
+                        remaining = max(target - balance, Decimal("0"))
+                        progress = (
+                            f"накоплено {format_money(balance)} / "
+                            f"{format_money(target)} ₸ · осталось "
+                            f"{format_money(remaining)} ₸"
+                        )
+                    else:
+                        progress = (
+                            f"накоплено {format_money(balance)} ₸ · "
+                            "напишите общую стоимость цели"
+                        )
                     lines.append(
                         f"• {goal.icon} {escape(goal.name)}: "
                         f"{format_money(posted.entry.original_amount)} "
                         f"{posted.entry.original_currency} → "
-                        f"<b>{format_money(posted.entry.amount_kzt)} ₸</b> · "
-                        f"в цели {format_money(balance)} ₸"
+                        f"<b>{format_money(posted.entry.amount_kzt)} ₸</b> · {progress}"
                     )
                 response = "\n".join(lines)
             else:
                 raise ValueError("неизвестный тип финансовой операции")
-        await message.reply(response)
+        await message.reply(response, reply_markup=main_menu_keyboard())
     except RateUnavailableError:
         await message.reply(
             "Не нашёл официальный курс. Операция не проведена. Владелец может задать "
@@ -917,6 +997,67 @@ async def handle_natural_operation(
         await message.reply(f"Не удалось провести операцию: {escape(str(exc))}")
     except Exception:
         await message.reply("❌ Нейросеть не смогла разобрать сообщение. Операция не проведена.")
+
+
+def custom_goal_key(name: str) -> str:
+    normalized = " ".join(name.casefold().split())
+    return f"custom_{sha256(normalized.encode()).hexdigest()[:16]}"
+
+
+async def resolve_savings_goal(
+    session: AsyncSession,
+    rate_service: RateService,
+    household: Household,
+    item: InterpretedExpenseItem,
+    goal_by_key: dict[str, SavingsGoal],
+    on_date: date,
+) -> SavingsGoal:
+    goal = goal_by_key.get(item.goal_key or "")
+    requested_name = (item.goal_name or "").strip()
+    if goal is None and requested_name:
+        normalized_name = " ".join(requested_name.casefold().split())
+        goal = next(
+            (
+                existing
+                for existing in goal_by_key.values()
+                if " ".join(existing.name.casefold().split()) == normalized_name
+            ),
+            None,
+        )
+    if goal is None:
+        requested_name = requested_name or (item.goal_key or "").strip()
+        if not requested_name:
+            raise ValueError("не понял название цели накопления")
+        key = custom_goal_key(requested_name)
+        goal = await session.scalar(
+            select(SavingsGoal).where(
+                SavingsGoal.household_id == household.id,
+                SavingsGoal.key == key,
+            )
+        )
+        if goal is None:
+            goal = SavingsGoal(
+                household_id=household.id,
+                key=key,
+                name=requested_name[:160],
+                icon="🎯",
+                goal_type="goal",
+                target_amount=Decimal("0"),
+                monthly_target=Decimal("0"),
+                currency="KZT",
+            )
+            session.add(goal)
+            await session.flush()
+        else:
+            goal.active = True
+        goal_by_key[goal.key] = goal
+
+    if item.target_amount is not None:
+        target_currency = normalize_currency(item.target_currency or "KZT")
+        target_quote = await rate_service.get_quote(session, target_currency, on_date)
+        goal.target_amount = target_quote.to_kzt(Decimal(str(item.target_amount)))
+        goal.currency = "KZT"
+    return goal
 
 
 async def latest_expense_context(
@@ -1203,7 +1344,7 @@ async def correct_last_expense(
                 response = await build_expense_response(
                     session, cycle.id, [(new_posted, category)]
                 )
-        await message.reply(response)
+        await message.reply(response, reply_markup=main_menu_keyboard())
     except RateUnavailableError:
         await message.reply("Не удалось исправить: нет актуального курса валюты.")
     except (CurrencyError, InvalidOperation, ValueError) as exc:

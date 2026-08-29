@@ -14,12 +14,20 @@ class InterpretedExpenseItem(BaseModel):
     currency: str | None = None
     category_key: str | None = None
     goal_key: str | None = None
+    goal_name: str | None = None
+    target_amount: float | None = Field(default=None, gt=0)
+    target_currency: str | None = None
     target_item_number: int | None = Field(default=None, ge=1)
     confidence: float = Field(ge=0, le=1)
 
     @field_validator("currency")
     @classmethod
     def currency_upper(cls, value: str | None) -> str | None:
+        return value.strip().upper() if value else None
+
+    @field_validator("target_currency")
+    @classmethod
+    def target_currency_upper(cls, value: str | None) -> str | None:
         return value.strip().upper() if value else None
 
 
@@ -31,6 +39,7 @@ class ExpenseInterpretation(BaseModel):
         "income",
         "goal_contribution",
         "goal_expense",
+        "goal_target",
         "correction",
         "other",
     ]
@@ -130,6 +139,7 @@ Rules:
 - kind=income when money was received, including salary.
 - kind=goal_contribution when money was intentionally set aside into a savings goal.
 - kind=goal_expense when a payment must be taken from an existing savings fund.
+- kind=goal_target when the user only specifies or changes the total price of a savings goal.
 - kind=correction only when the user clearly corrects the previous operation, for example
   "нет", "на самом деле", "исправь", "вместо" or "ошибка".
 - kind=other for a non-financial message, a question with no operation, or when the amount
@@ -139,19 +149,24 @@ Rules:
   use {self.default_currency}.
 - For income, every item needs description, positive amount, ISO 4217 currency and confidence.
   Salary without an explicit currency is KZT for this household.
-- For goal_contribution and goal_expense, every item also needs a valid goal_key.
+- For an existing savings goal, return its goal_key. For a new goal such as a laptop,
+  return goal_key=null and a concise goal_name in Russian. New goals are allowed.
+- For goal_contribution and goal_expense, every item needs either an existing goal_key or
+  a goal_name. If the same message states the full price, put it in target_amount and
+  target_currency separately from the contribution amount and currency.
+- For goal_target, return the goal key or name plus target_amount and target_currency.
+  If the target currency is omitted, use KZT for this household.
 - For a correction, return only values that change; null means keep the previous value.
 - target_item_number is only for correcting a numbered receipt item.
 - category_key must be one of the allowed keys. Classify supermarket drinks, milk and snacks
   as groceries_household unless the message explicitly says they were consumed in a cafe.
-- goal_key must be one of the allowed savings goals.
 - Do not invent amounts, merchants, products, categories or currencies. If a correction says
   "for the same money", leave amount null.
 
 Allowed categories:
 {category_lines}
 
-Allowed savings goals:
+Existing savings goals (a new goal name is also allowed):
 {goal_lines}
 
 Previous operation, when available:

@@ -15,7 +15,7 @@ from family_bot.models import Household, ScheduledRun, utcnow
 from family_bot.services.cycles import get_current_cycle
 from family_bot.services.rates import RateService
 from family_bot.services.reports import build_report
-from family_bot.telegram.keyboards import cycle_close_keyboard
+from family_bot.telegram.keyboards import cycle_close_keyboard, main_menu_keyboard
 
 logger = logging.getLogger(__name__)
 
@@ -96,16 +96,17 @@ class ReportScheduler:
                 self.settings.financial_cycle_start_day,
             )
             text = await build_report(session, self.rate_service, household, cycle, now.date())
-            keyboard = (
-                cycle_close_keyboard(cycle.id)
-                if now.date() >= cycle.end_date and cycle.status == "open"
-                else None
-            )
             await self.bot.send_message(
                 household.telegram_chat_id,
                 text,
-                reply_markup=keyboard,
+                reply_markup=main_menu_keyboard(),
             )
+            if now.date() >= cycle.end_date and cycle.status == "open":
+                await self.bot.send_message(
+                    household.telegram_chat_id,
+                    "Финансовый месяц завершён. Куда направить остаток?",
+                    reply_markup=cycle_close_keyboard(cycle.id),
+                )
             run.status = "completed"
             run.completed_at = utcnow()
             run.error_message = None

@@ -121,9 +121,16 @@ async def build_report(
         "<b>Бюджет месяца</b>",
     ]
     for category, limit, spent in rows:
+        remaining = limit - spent
+        remainder_text = (
+            f"осталось {format_money(remaining)} ฿"
+            if remaining >= 0
+            else f"перерасход {format_money(abs(remaining))} ฿"
+        )
         lines.append(
             f"{status_icon(spent, limit)} {category.icon} {category.name}\n"
-            f"[{progress_bar(spent, limit)}] {format_money(spent)} / {format_money(limit)} ฿"
+            f"[{progress_bar(spent, limit)}] {format_money(spent)} / "
+            f"{format_money(limit)} ฿ · <b>{remainder_text}</b>"
         )
     lines.extend(
         [
@@ -153,14 +160,20 @@ async def build_report(
     ).all()
     for goal in goals:
         balance = await goal_balance(session, household.id, goal.id)
-        lines.extend(
-            [
-                "",
-                f"{goal.icon} <b>{goal.name}</b>",
-                f"[{progress_bar(balance, Decimal(goal.target_amount))}] "
-                f"{format_money(balance)} / {format_money(goal.target_amount)} {goal.currency}",
-            ]
-        )
+        target = Decimal(goal.target_amount)
+        if target > 0:
+            remaining = max(target - balance, Decimal("0"))
+            progress = (
+                f"[{progress_bar(balance, target)}] {format_money(balance)} / "
+                f"{format_money(target)} {goal.currency} · "
+                f"<b>осталось {format_money(remaining)} {goal.currency}</b>"
+            )
+        else:
+            progress = (
+                f"Накоплено <b>{format_money(balance)} {goal.currency}</b> · "
+                "общая стоимость не задана"
+            )
+        lines.extend(["", f"{goal.icon} <b>{goal.name}</b>", progress])
     if local_date >= cycle.end_date and cycle.status == "open":
         lines.extend(
             [

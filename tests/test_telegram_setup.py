@@ -20,7 +20,7 @@ class FakeMessage:
         self.from_user = SimpleNamespace(id=user_id, full_name=f"User {user_id}")
         self.replies: list[str] = []
 
-    async def reply(self, text: str) -> None:
+    async def reply(self, text: str, **kwargs: object) -> None:
         self.replies.append(text)
 
 
@@ -42,6 +42,7 @@ def test_other_simple_commands_accept_harmless_punctuation() -> None:
     assert BALANCE_COMMAND_RE.fullmatch("/balance.")
     assert BALANCE_COMMAND_RE.fullmatch("остаток?")
     assert HELP_COMMAND_RE.fullmatch("/start@zimmersfamili_bot!")
+    assert BALANCE_COMMAND_RE.fullmatch("💰 Баланс")
     assert not SETUP_COMMAND_RE.fullmatch("/setup now")
 
 
