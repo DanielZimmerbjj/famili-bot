@@ -828,6 +828,24 @@ async def handle_natural_operation(
                 "ℹ️ Нейросеть не нашла в сообщении финансовой операции. Ничего не записал."
             )
             return
+        if interpretation.kind == "report":
+            async with deps.session_factory() as session:
+                cycle = await get_current_cycle(
+                    session,
+                    household,
+                    local_now.date(),
+                    deps.settings.financial_cycle_start_day,
+                )
+                report = await build_report(
+                    session,
+                    deps.rate_service,
+                    household,
+                    cycle,
+                    local_now.date(),
+                )
+                await session.commit()
+            await message.reply(report, reply_markup=main_menu_keyboard())
+            return
         if not interpretation.items:
             raise ValueError("нейросеть определила тип операции, но не вернула сумму")
 

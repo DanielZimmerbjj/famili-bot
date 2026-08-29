@@ -1,4 +1,5 @@
 from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
@@ -106,6 +107,35 @@ async def test_non_financial_text_is_not_posted() -> None:
 
     assert interpreter.calls == ["кто заберёт ребёнка?"]
     assert message.replies and "Ничего не записал" in message.replies[0]
+    async with factory() as session:
+        assert await session.scalar(select(func.count(LedgerEntry.id))) == 0
+    await engine.dispose()
+
+
+async def test_natural_report_request_returns_full_report(monkeypatch) -> None:
+    engine, factory, household, settings = await make_budget()
+    interpreter = FakeInterpreter(
+        ExpenseInterpretation(
+            kind="report",
+            items=[],
+            overall_confidence=0.99,
+        )
+    )
+    report_builder = AsyncMock(return_value="Полный семейный отчёт")
+    monkeypatch.setattr("family_bot.telegram.handlers.build_report", report_builder)
+    deps = SimpleNamespace(
+        settings=settings,
+        session_factory=factory,
+        rate_service=RateService(),
+        expense_interpreter=interpreter,
+    )
+    message = FakeMessage()
+
+    await handle_natural_operation(message, deps, household, 42, "скинь отчёт")
+
+    assert interpreter.calls == ["скинь отчёт"]
+    assert message.replies == ["Полный семейный отчёт"]
+    report_builder.assert_awaited_once()
     async with factory() as session:
         assert await session.scalar(select(func.count(LedgerEntry.id))) == 0
     await engine.dispose()

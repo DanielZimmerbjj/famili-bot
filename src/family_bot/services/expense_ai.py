@@ -40,6 +40,7 @@ class ExpenseInterpretation(BaseModel):
         "goal_contribution",
         "goal_expense",
         "goal_target",
+        "report",
         "correction",
         "other",
     ]
@@ -140,6 +141,8 @@ Rules:
 - kind=goal_contribution when money was intentionally set aside into a savings goal.
 - kind=goal_expense when a payment must be taken from an existing savings fund.
 - kind=goal_target when the user only specifies or changes the total price of a savings goal.
+- kind=report when the user asks to show, send or summarize the family finances, budget,
+  expenses, income, balances, category limits or savings progress. A report is read-only.
 - kind=correction only when the user clearly corrects the previous operation, for example
   "нет", "на самом деле", "исправь", "вместо" or "ошибка".
 - kind=other for a non-financial message, a question with no operation, or when the amount
@@ -156,6 +159,8 @@ Rules:
   target_currency separately from the contribution amount and currency.
 - For goal_target, return the goal key or name plus target_amount and target_currency.
   If the target currency is omitted, use KZT for this household.
+- For report, return an empty items list. Requests such as "скинь отчет", "покажи бюджет",
+  "сколько денег осталось" and "как у нас дела с накоплениями" are reports, not other.
 - For a correction, return only values that change; null means keep the previous value.
 - target_item_number is only for correcting a numbered receipt item.
 - category_key must be one of the allowed keys. Classify supermarket drinks, milk and snacks

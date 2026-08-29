@@ -86,4 +86,6 @@ def test_interpreter_prompt_delegates_all_financial_kinds_to_ai() -> None:
     assert "kind=income" in prompt
     assert "kind=goal_contribution" in prompt
     assert "kind=goal_expense" in prompt
+    assert "kind=report" in prompt
+    assert "скинь отчет" in prompt
     assert "Never turn an ordinary conversation into a financial operation" in prompt
