@@ -1,0 +1,520 @@
+from __future__ import annotations
+
+import asyncio
+import hashlib
+import logging
+from collections import defaultdict
+from contextlib import suppress
+from datetime import UTC, timedelta
+from decimal import Decimal
+from html import escape
+from io import BytesIO
+from pathlib import Path
+
+from aiogram import Bot
+from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
+from sqlalchemy import func, select, update
+from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.orm import selectinload
+
+from family_bot.config import Settings
+from family_bot.models import (
+    BudgetCycle,
+    Category,
+    CategoryAlias,
+    Household,
+    Receipt,
+    ReceiptImage,
+    ReceiptItem,
+    Subcategory,
+    utcnow,
+)
+from family_bot.services.ledger import post_expense
+from family_bot.services.money import normalize_currency, quantize
+from family_bot.services.rates import RateService, RateUnavailableError
+from family_bot.services.receipt_ai import ExtractedItem, ReceiptExtraction, ReceiptExtractor
+
+logger = logging.getLogger(__name__)
+
+
+class ReceiptValidationError(ValueError):
+    pass
+
+
+class ReceiptService:
+    def __init__(self, settings: Settings) -> None:
+        self.settings = settings
+
+    async def enqueue(
+        self,
+        session: AsyncSession,
+        household: Household,
+        cycle_id: str,
+        chat_id: int,
+        message_id: int,
+        user_id: int,
+        file_id: str,
+        file_unique_id: str,
+        mime_type: str,
+        media_group_id: str | None,
+    ) -> tuple[Receipt, bool, bool]:
+        existing_image = await session.scalar(
+            select(ReceiptImage).where(
+                ReceiptImage.telegram_file_unique_id == file_unique_id,
+            )
+        )
+        if existing_image is not None:
+            existing_receipt = await session.get(Receipt, existing_image.receipt_id)
+            if existing_receipt is None:
+                raise RuntimeError("Receipt image points to a missing receipt")
+            return existing_receipt, False, False
+
+        receipt: Receipt | None = None
+        if media_group_id:
+            receipt = await session.scalar(
+                select(Receipt).where(
+                    Receipt.telegram_chat_id == chat_id,
+                    Receipt.telegram_media_group_id == media_group_id,
+                )
+            )
+        is_new = receipt is None
+        if receipt is None:
+            delay = 4 if media_group_id else 0
+            receipt = Receipt(
+                household_id=household.id,
+                cycle_id=cycle_id,
+                telegram_chat_id=chat_id,
+                telegram_message_id=message_id,
+                telegram_media_group_id=media_group_id,
+                created_by_user_id=user_id,
+                status="received",
+                next_attempt_at=utcnow() + timedelta(seconds=delay),
+            )
+            session.add(receipt)
+            await session.flush()
+        elif receipt.status == "received":
+            receipt.next_attempt_at = utcnow() + timedelta(seconds=4)
+
+        page_order = int(
+            await session.scalar(
+                select(func.count(ReceiptImage.id)).where(ReceiptImage.receipt_id == receipt.id)
+            )
+            or 0
+        )
+        session.add(
+            ReceiptImage(
+                receipt_id=receipt.id,
+                telegram_file_id=file_id,
+                telegram_file_unique_id=file_unique_id,
+                page_order=page_order,
+                mime_type=mime_type,
+            )
+        )
+        await session.flush()
+        return receipt, is_new, True
+
+
+class ReceiptWorker:
+    def __init__(
+        self,
+        settings: Settings,
+        session_factory: async_sessionmaker[AsyncSession],
+        bot: Bot,
+        extractor: ReceiptExtractor,
+        rate_service: RateService,
+    ) -> None:
+        self.settings = settings
+        self.session_factory = session_factory
+        self.bot = bot
+        self.extractor = extractor
+        self.rate_service = rate_service
+        self.stop_event = asyncio.Event()
+
+    async def run(self) -> None:
+        logger.info("Receipt worker started")
+        await self._recover_inflight()
+        while not self.stop_event.is_set():
+            receipt_id = await self._claim_next()
+            if receipt_id is None:
+                with suppress(TimeoutError):
+                    await asyncio.wait_for(
+                        self.stop_event.wait(), timeout=self.settings.receipt_poll_seconds
+                    )
+                continue
+            try:
+                await self._process(receipt_id)
+            except Exception:
+                logger.exception("Unexpected receipt worker failure for %s", receipt_id)
+        logger.info("Receipt worker stopped")
+
+    async def stop(self) -> None:
+        self.stop_event.set()
+
+    async def _recover_inflight(self) -> None:
+        async with self.session_factory() as session, session.begin():
+            await session.execute(
+                update(Receipt)
+                .where(Receipt.status == "analyzing")
+                .values(status="retrying", next_attempt_at=utcnow())
+            )
+
+    async def _claim_next(self) -> str | None:
+        async with self.session_factory() as session, session.begin():
+            statement = (
+                select(Receipt)
+                .where(
+                    Receipt.status.in_(("received", "retrying")),
+                    Receipt.next_attempt_at <= utcnow(),
+                    Receipt.retry_count < self.settings.receipt_retry_limit,
+                )
+                .order_by(Receipt.created_at)
+                .limit(1)
+                .with_for_update(skip_locked=True)
+            )
+            receipt = await session.scalar(statement)
+            if receipt is None:
+                return None
+            receipt.status = "analyzing"
+            receipt.error_message = None
+            return receipt.id
+
+    async def _process(self, receipt_id: str) -> None:
+        try:
+            async with self.session_factory() as session:
+                receipt = await session.scalar(
+                    select(Receipt)
+                    .where(Receipt.id == receipt_id)
+                    .options(selectinload(Receipt.images))
+                )
+                if receipt is None:
+                    return
+                image_payloads = await self._download_images(session, receipt)
+                categories, category_models, subcategory_models = await self._categories(
+                    session, receipt.household_id
+                )
+                aliases = await self._aliases(session, receipt.household_id, category_models)
+                extraction, model_name = await self.extractor.extract(
+                    image_payloads, categories, aliases
+                )
+                await self._validate_and_post(
+                    session,
+                    receipt,
+                    extraction,
+                    model_name,
+                    category_models,
+                    subcategory_models,
+                )
+                await session.commit()
+        except ReceiptValidationError as exc:
+            await self._mark_review(receipt_id, str(exc))
+        except RateUnavailableError as exc:
+            await self._mark_review(receipt_id, f"Нет курса: {exc}", status="rate_pending")
+        except Exception as exc:
+            logger.exception("Receipt %s processing failed", receipt_id)
+            await self._mark_failed(receipt_id, str(exc))
+        else:
+            try:
+                await self._send_confirmation(receipt_id)
+            except Exception:
+                logger.exception(
+                    "Receipt %s was posted but its Telegram confirmation failed", receipt_id
+                )
+
+    async def _download_images(
+        self, session: AsyncSession, receipt: Receipt
+    ) -> list[tuple[bytes, str]]:
+        payloads: list[tuple[bytes, str]] = []
+        storage_dir = Path(self.settings.receipt_storage_path) / receipt.id
+        storage_dir.mkdir(parents=True, exist_ok=True)
+        for image in sorted(receipt.images, key=lambda item: item.page_order):
+            stream = BytesIO()
+            await self.bot.download(image.telegram_file_id, destination=stream)
+            data = stream.getvalue()
+            if not data:
+                raise ReceiptValidationError("Telegram вернул пустое изображение")
+            digest = hashlib.sha256(data).hexdigest()
+            duplicate = await session.scalar(
+                select(ReceiptImage).where(
+                    ReceiptImage.sha256 == digest,
+                    ReceiptImage.receipt_id != receipt.id,
+                )
+            )
+            if duplicate is not None:
+                raise ReceiptValidationError("Вероятный дубликат уже загруженного чека")
+            extension = ".png" if image.mime_type == "image/png" else ".jpg"
+            path = storage_dir / f"{image.page_order + 1}{extension}"
+            path.write_bytes(data)
+            image.sha256 = digest
+            image.storage_path = str(path)
+            payloads.append((data, image.mime_type))
+        await session.flush()
+        return payloads
+
+    async def _categories(
+        self, session: AsyncSession, household_id: str
+    ) -> tuple[dict[str, tuple[str, ...]], dict[str, Category], dict[str, Subcategory]]:
+        category_rows = (
+            await session.scalars(
+                select(Category)
+                .where(Category.household_id == household_id, Category.active.is_(True))
+                .options(selectinload(Category.subcategories))
+            )
+        ).all()
+        category_models = {category.key: category for category in category_rows}
+        subcategory_models = {
+            f"{category.key}:{subcategory.key}": subcategory
+            for category in category_rows
+            for subcategory in category.subcategories
+        }
+        contract = {
+            category.key: tuple(subcategory.key for subcategory in category.subcategories)
+            for category in category_rows
+        }
+        return contract, category_models, subcategory_models
+
+    async def _aliases(
+        self,
+        session: AsyncSession,
+        household_id: str,
+        categories: dict[str, Category],
+    ) -> dict[str, tuple[str, str | None]]:
+        aliases = (
+            await session.scalars(
+                select(CategoryAlias).where(CategoryAlias.household_id == household_id)
+            )
+        ).all()
+        category_keys = {category.id: key for key, category in categories.items()}
+        return {
+            alias.normalized_name: (category_keys[alias.category_id], None)
+            for alias in aliases
+            if alias.category_id in category_keys
+        }
+
+    async def _validate_and_post(
+        self,
+        session: AsyncSession,
+        receipt: Receipt,
+        extraction: ReceiptExtraction,
+        model_name: str,
+        categories: dict[str, Category],
+        subcategories: dict[str, Subcategory],
+    ) -> None:
+        if extraction.document_type != "receipt":
+            raise ReceiptValidationError("На изображении не найден чек")
+        if extraction.total <= 0:
+            raise ReceiptValidationError("Не удалось прочитать положительный итог чека")
+        if not extraction.items:
+            raise ReceiptValidationError("Не удалось прочитать позиции чека")
+        currency = normalize_currency(extraction.currency)
+        weak_items = [
+            item
+            for item in extraction.items
+            if item.category_key not in categories
+            or item.confidence < self.settings.receipt_review_confidence
+        ]
+        if weak_items or extraction.overall_confidence < self.settings.receipt_review_confidence:
+            names = ", ".join(item.raw_name for item in weak_items[:5])
+            raise ReceiptValidationError(f"Нужно уточнить категории/текст: {names or 'весь чек'}")
+
+        items = list(extraction.items)
+        allocated_totals = allocate_receipt_total(
+            items,
+            extraction.total,
+            extraction.discount,
+            extraction.tax,
+        )
+
+        purchased_at = extraction.purchased_at or receipt.created_at
+        if purchased_at.tzinfo is None:
+            purchased_at = purchased_at.replace(tzinfo=self.settings.timezone)
+        else:
+            purchased_at = purchased_at.astimezone(self.settings.timezone)
+        household = await session.get(Household, receipt.household_id)
+        if household is None:
+            raise RuntimeError("Household disappeared during receipt processing")
+
+        grouped: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+        source_rate = await self.rate_service.get_quote(session, currency, purchased_at.date())
+        for item, allocated_total in zip(items, allocated_totals, strict=True):
+            category = categories[item.category_key]
+            subcategory = None
+            if item.subcategory_key:
+                subcategory = subcategories.get(f"{item.category_key}:{item.subcategory_key}")
+                if subcategory is None:
+                    raise ReceiptValidationError(
+                        f"Недопустимая подкатегория {item.subcategory_key} для {item.raw_name}"
+                    )
+            amount_kzt = source_rate.to_kzt(allocated_total)
+            envelope_rate = await self.rate_service.get_quote(
+                session, category.envelope_currency, purchased_at.date()
+            )
+            envelope_amount = envelope_rate.from_kzt(amount_kzt)
+            session.add(
+                ReceiptItem(
+                    receipt_id=receipt.id,
+                    category_id=category.id,
+                    subcategory_id=subcategory.id if subcategory else None,
+                    raw_name=item.raw_name[:500],
+                    quantity=quantize(item.quantity),
+                    unit_price=quantize(item.unit_price) if item.unit_price is not None else None,
+                    line_total=allocated_total,
+                    amount_kzt=amount_kzt,
+                    envelope_amount=envelope_amount,
+                    envelope_currency=category.envelope_currency,
+                    confidence=Decimal(str(item.confidence)),
+                )
+            )
+            grouped[item.category_key] += allocated_total
+
+        for category_key, amount in grouped.items():
+            await post_expense(
+                session=session,
+                rate_service=self.rate_service,
+                household=household,
+                cycle=await session.get_one(BudgetCycle, receipt.cycle_id),
+                category=categories[category_key],
+                amount=amount,
+                currency=currency,
+                description=f"{extraction.merchant or 'Чек'} · {category_key}",
+                occurred_at=purchased_at,
+                user_id=receipt.created_by_user_id,
+                receipt_id=receipt.id,
+            )
+
+        receipt.status = "posted"
+        receipt.merchant = extraction.merchant
+        receipt.purchased_at = purchased_at.astimezone(UTC)
+        receipt.original_currency = currency
+        receipt.original_total = quantize(extraction.total)
+        receipt.total_kzt = source_rate.to_kzt(extraction.total)
+        receipt.exchange_rate_id = source_rate.rate_id
+        receipt.model_name = model_name
+        receipt.schema_version = self.extractor.schema_version
+        receipt.extraction = extraction.model_dump(mode="json")
+        receipt.overall_confidence = Decimal(str(extraction.overall_confidence))
+        receipt.posted_at = utcnow()
+        receipt.error_message = None
+
+    async def _send_confirmation(self, receipt_id: str) -> None:
+        async with self.session_factory() as session:
+            receipt = await session.scalar(
+                select(Receipt).where(Receipt.id == receipt_id).options(selectinload(Receipt.items))
+            )
+            if receipt is None or receipt.status != "posted":
+                return
+            category_ids = {item.category_id for item in receipt.items if item.category_id}
+            categories = (
+                await session.scalars(select(Category).where(Category.id.in_(category_ids)))
+            ).all()
+            names = {category.id: f"{category.icon} {category.name}" for category in categories}
+            grouped: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
+            for item in receipt.items:
+                if item.category_id:
+                    grouped[item.category_id] += Decimal(item.line_total)
+            lines = [
+                f"✅ <b>{escape(receipt.merchant or 'Чек')}</b> · "
+                f"{format_money(receipt.original_total)} {receipt.original_currency}"
+            ]
+            lines.extend(
+                f"{names.get(category_id, 'Категория')}: {format_money(amount)} "
+                f"{receipt.original_currency}"
+                for category_id, amount in grouped.items()
+            )
+            lines.append(f"Итого в учёте: {format_money(receipt.total_kzt)} ₸")
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="✅ Верно", callback_data=f"receipt:confirm:{receipt.id}"
+                        ),
+                        InlineKeyboardButton(
+                            text="✏️ Исправить", callback_data=f"receipt:edit:{receipt.id}"
+                        ),
+                        InlineKeyboardButton(
+                            text="🗑 Удалить", callback_data=f"receipt:delete:{receipt.id}"
+                        ),
+                    ]
+                ]
+            )
+            await self.bot.send_message(
+                receipt.telegram_chat_id,
+                "\n".join(lines),
+                reply_to_message_id=receipt.telegram_message_id,
+                reply_markup=keyboard,
+            )
+
+    async def _mark_review(
+        self, receipt_id: str, message: str, status: str = "needs_review"
+    ) -> None:
+        async with self.session_factory() as session, session.begin():
+            receipt = await session.get(Receipt, receipt_id)
+            if receipt is None:
+                return
+            receipt.status = status
+            receipt.error_message = message[:2000]
+            chat_id = receipt.telegram_chat_id
+            message_id = receipt.telegram_message_id
+        await self.bot.send_message(
+            chat_id,
+            f"⚠️ Чек пока не проведён: {escape(message)}",
+            reply_to_message_id=message_id,
+        )
+
+    async def _mark_failed(self, receipt_id: str, message: str) -> None:
+        should_notify = False
+        chat_id = 0
+        message_id = 0
+        async with self.session_factory() as session, session.begin():
+            receipt = await session.get(Receipt, receipt_id)
+            if receipt is None:
+                return
+            receipt.retry_count += 1
+            receipt.error_message = message[:2000]
+            chat_id = receipt.telegram_chat_id
+            message_id = receipt.telegram_message_id
+            if receipt.retry_count >= self.settings.receipt_retry_limit:
+                receipt.status = "failed"
+                should_notify = True
+            else:
+                receipt.status = "retrying"
+                receipt.next_attempt_at = utcnow() + timedelta(seconds=2**receipt.retry_count * 10)
+        if should_notify:
+            await self.bot.send_message(
+                chat_id,
+                "❌ Не удалось обработать чек после нескольких попыток. Он сохранён и не списан.",
+                reply_to_message_id=message_id,
+            )
+
+
+def format_money(value: Decimal | None) -> str:
+    if value is None:
+        return "0"
+    decimal = Decimal(value)
+    if decimal == decimal.to_integral():
+        return f"{decimal:,.0f}".replace(",", " ")
+    return f"{decimal:,.2f}".replace(",", " ")
+
+
+def allocate_receipt_total(
+    items: list[ExtractedItem],
+    total: Decimal,
+    discount: Decimal,
+    tax: Decimal,
+) -> list[Decimal]:
+    """Reconcile receipt-level discount/tax and allocate the paid total across items."""
+    item_total = sum((item.line_total for item in items), Decimal("0"))
+    if total <= 0 or item_total <= 0:
+        raise ReceiptValidationError("Итог чека и сумма позиций должны быть положительными")
+
+    tolerance = max(Decimal("1"), abs(total) * Decimal("0.005"))
+    direct_difference = abs(total - item_total)
+    adjusted_difference = abs(total - (item_total - discount + tax))
+    if min(direct_difference, adjusted_difference) > tolerance:
+        raise ReceiptValidationError(f"Сумма позиций {item_total} не сходится с итогом {total}")
+
+    allocations = [quantize(total * item.line_total / item_total) for item in items]
+    residual = quantize(total) - sum(allocations, Decimal("0"))
+    if residual:
+        largest_index = max(range(len(items)), key=lambda index: items[index].line_total)
+        allocations[largest_index] = quantize(allocations[largest_index] + residual)
+    return allocations
