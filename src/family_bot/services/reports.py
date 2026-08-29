@@ -20,10 +20,10 @@ from family_bot.services.receipts import format_money
 
 def progress_bar(spent: Decimal, limit: Decimal, width: int = 10) -> str:
     if limit <= 0:
-        return "□" * width
+        return "░" * width
     fraction = max(Decimal("0"), min(spent / limit, Decimal("1")))
     filled = min(width, int(fraction * width))
-    return "█" * filled + "□" * (width - filled)
+    return "█" * filled + "░" * (width - filled)
 
 
 def status_icon(spent: Decimal, limit: Decimal) -> str:

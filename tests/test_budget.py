@@ -13,7 +13,7 @@ def test_income_total() -> None:
 
 
 def test_progress_visuals() -> None:
-    assert progress_bar(Decimal("50"), Decimal("100")) == "█████□□□□□"
+    assert progress_bar(Decimal("50"), Decimal("100")) == "█████░░░░░"
     assert status_icon(Decimal("69"), Decimal("100")) == "🟢"
     assert status_icon(Decimal("70"), Decimal("100")) == "🟡"
     assert status_icon(Decimal("90"), Decimal("100")) == "🔴"
