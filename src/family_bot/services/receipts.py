@@ -25,6 +25,7 @@ from family_bot.models import (
     CategoryAlias,
     ExchangeRate,
     Household,
+    LedgerEntry,
     Receipt,
     ReceiptImage,
     ReceiptItem,
@@ -655,6 +656,55 @@ def is_seven_eleven_merchant(merchant: str | None) -> bool:
         return True
     compact = "".join(character for character in normalized if character.isalnum())
     return any(marker in compact for marker in ("7eleven", "seveneleven", "711", "cpall"))
+
+
+async def backfill_seven_eleven_receipts(
+    session: AsyncSession,
+    household: Household,
+) -> int:
+    """Move previously posted 7-Eleven receipts into the dedicated envelope."""
+    category = await session.scalar(
+        select(Category).where(
+            Category.household_id == household.id,
+            Category.key == SEVEN_ELEVEN_CATEGORY_KEY,
+        )
+    )
+    if category is None:
+        return 0
+
+    receipts = (
+        await session.scalars(
+            select(Receipt).where(
+                Receipt.household_id == household.id,
+                Receipt.status == "posted",
+            )
+        )
+    ).all()
+    receipt_ids = [
+        receipt.id for receipt in receipts if is_seven_eleven_merchant(receipt.merchant)
+    ]
+    if not receipt_ids:
+        return 0
+
+    item_result = await session.execute(
+        update(ReceiptItem)
+        .where(
+            ReceiptItem.receipt_id.in_(receipt_ids),
+            ReceiptItem.category_id.is_distinct_from(category.id),
+        )
+        .values(category_id=category.id, subcategory_id=None)
+    )
+    await session.execute(
+        update(LedgerEntry)
+        .where(
+            LedgerEntry.receipt_id.in_(receipt_ids),
+            LedgerEntry.status == "posted",
+            LedgerEntry.entry_type == "expense",
+            LedgerEntry.category_id.is_distinct_from(category.id),
+        )
+        .values(category_id=category.id)
+    )
+    return int(item_result.rowcount or 0)
 
 
 def prepare_receipt_items(

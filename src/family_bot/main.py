@@ -20,7 +20,11 @@ from family_bot.services.cycles import seed_default_household
 from family_bot.services.expense_ai import ExpenseInterpreter
 from family_bot.services.rates import RateService
 from family_bot.services.receipt_ai import ReceiptExtractor
-from family_bot.services.receipts import ReceiptService, ReceiptWorker
+from family_bot.services.receipts import (
+    ReceiptService,
+    ReceiptWorker,
+    backfill_seven_eleven_receipts,
+)
 from family_bot.services.scheduler import ReportScheduler
 from family_bot.telegram.handlers import TelegramDependencies, build_router
 
@@ -101,7 +105,14 @@ def create_app() -> FastAPI:
         )
         if settings.auto_seed:
             async with database.session_factory() as session, session.begin():
-                await seed_default_household(session, settings)
+                household = await seed_default_household(session, settings)
+                if household is not None:
+                    migrated_items = await backfill_seven_eleven_receipts(session, household)
+                    if migrated_items:
+                        logger.info(
+                            "Moved %s existing 7-Eleven receipt items to the dedicated envelope",
+                            migrated_items,
+                        )
         polling_task: asyncio.Task[None] | None = None
         if settings.telegram_delivery_mode == "webhook":
             if not settings.telegram_webhook_url:
