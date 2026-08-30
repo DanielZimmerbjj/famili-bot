@@ -174,8 +174,10 @@ Rules:
 - For a correction, return only values that change; null means keep the previous value.
   Do not use correction for editing a savings goal; use goal_update.
 - target_item_number is only for correcting a numbered receipt item.
-- category_key must be one of the allowed keys. Classify supermarket drinks, milk and snacks
-  as groceries_household unless the message explicitly says they were consumed in a cafe.
+- category_key must be one of the allowed keys. A purchase explicitly made at 7-Eleven,
+  7-11 or Seven Eleven always uses seven_eleven regardless of the purchased items.
+  Classify other supermarket drinks, milk and snacks as groceries_household unless the
+  message explicitly says they were consumed in a cafe.
 - Do not invent amounts, merchants, products, categories or currencies. If a correction says
   "for the same money", leave amount null.
 

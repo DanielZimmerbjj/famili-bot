@@ -13,6 +13,9 @@ class BudgetTemplate:
     subcategories: tuple[str, ...] = ()
 
 
+SEVEN_ELEVEN_CATEGORY_KEY = "seven_eleven"
+
+
 BUDGET_TEMPLATES: tuple[BudgetTemplate, ...] = (
     BudgetTemplate("rent", "Квартира", "🏠", Decimal("13500")),
     BudgetTemplate("utilities", "Коммуналка", "💡", Decimal("3500")),
@@ -24,6 +27,7 @@ BUDGET_TEMPLATES: tuple[BudgetTemplate, ...] = (
         Decimal("10000"),
         ("groceries", "household"),
     ),
+    BudgetTemplate(SEVEN_ELEVEN_CATEGORY_KEY, "7-Eleven", "🏪", Decimal("3000")),
     BudgetTemplate("fruit", "Фрукты", "🍉", Decimal("2000")),
     BudgetTemplate(
         "training",
@@ -97,6 +101,11 @@ CATEGORY_TEXT_ALIASES: dict[str, str] = {
     "бытовое": "groceries_household",
     "бытовая химия": "groceries_household",
     "бытовую химию": "groceries_household",
+    "7-eleven": SEVEN_ELEVEN_CATEGORY_KEY,
+    "7 eleven": SEVEN_ELEVEN_CATEGORY_KEY,
+    "7-11": SEVEN_ELEVEN_CATEGORY_KEY,
+    "севен элевен": SEVEN_ELEVEN_CATEGORY_KEY,
+    "севен": SEVEN_ELEVEN_CATEGORY_KEY,
     "фрукты": "fruit",
     "тренировка": "training",
     "тренировки": "training",

@@ -8,8 +8,10 @@ from family_bot.services.receipt_ai import ExtractedItem
 from family_bot.services.receipts import (
     ReceiptValidationError,
     allocate_receipt_total,
+    is_seven_eleven_merchant,
     normalize_purchased_at,
     prepare_chargeable_items,
+    prepare_receipt_items,
 )
 
 
@@ -86,6 +88,35 @@ def test_unknown_paid_item_falls_back_to_buffer_without_blocking_receipt() -> No
     assert len(prepared) == 1
     assert prepared[0].category_key == "buffer"
     assert uncertain == ["เนสท์เล่ ลาเต้"]
+
+
+def test_seven_eleven_receipt_uses_only_dedicated_category() -> None:
+    groceries = item("Молоко", "35")
+    meat = item("Сосиски", "65").model_copy(
+        update={"category_key": "meat", "subcategory_key": None, "confidence": 0.4}
+    )
+    freebie = item("Подарок", "0")
+
+    prepared, uncertain = prepare_receipt_items(
+        [groceries, meat, freebie],
+        "CP ALL, 7-Eleven",
+        categories={"seven_eleven": object()},  # type: ignore[dict-item]
+        subcategories={},
+        confidence_threshold=0.75,
+    )
+
+    assert len(prepared) == 2
+    assert {prepared_item.category_key for prepared_item in prepared} == {"seven_eleven"}
+    assert all(prepared_item.subcategory_key is None for prepared_item in prepared)
+    assert uncertain == []
+
+
+@pytest.mark.parametrize(
+    "merchant",
+    ("7-Eleven", "7 Eleven Thailand", "7-11", "CP ALL Public Company", "เซเว่น อีเลฟเว่น"),
+)
+def test_recognizes_seven_eleven_merchant_variants(merchant: str) -> None:
+    assert is_seven_eleven_merchant(merchant)
 
 
 def test_rejects_unreconciled_total() -> None:

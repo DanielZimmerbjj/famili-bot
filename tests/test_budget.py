@@ -5,7 +5,7 @@ from family_bot.services.reports import progress_bar, status_icon
 
 
 def test_budget_total() -> None:
-    assert sum((item.limit_thb for item in BUDGET_TEMPLATES), Decimal(0)) == Decimal("57100")
+    assert sum((item.limit_thb for item in BUDGET_TEMPLATES), Decimal(0)) == Decimal("60100")
 
 
 def test_income_total() -> None:

@@ -43,5 +43,5 @@ async def test_full_unused_budget_can_roll_into_savings() -> None:
             cycle.id,
             date(2026, 9, 4),
         )
-        assert amount == Decimal("799400.00000000")
+        assert amount == Decimal("841400.00000000")
     await engine.dispose()

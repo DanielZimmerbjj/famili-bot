@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from family_bot.config import Settings
+from family_bot.constants import SEVEN_ELEVEN_CATEGORY_KEY
 from family_bot.models import (
     BudgetCycle,
     Category,
@@ -363,8 +364,9 @@ class ReceiptWorker:
         if not extraction.items:
             raise ReceiptValidationError("Не удалось прочитать позиции чека")
         currency = normalize_currency(extraction.currency)
-        items, uncertain_names = prepare_chargeable_items(
+        items, uncertain_names = prepare_receipt_items(
             extraction.items,
+            extraction.merchant,
             categories,
             subcategories,
             self.settings.receipt_review_confidence,
@@ -483,7 +485,7 @@ class ReceiptWorker:
                 lines.append(
                     "⚠️ Проверьте сомнительные позиции: "
                     f"<b>{escape(review_warning)}</b>. "
-                    "Неизвестные категории временно отнесены в резерв."
+                    "Если что-то неверно, исправьте текстом или голосом."
                 )
             sorted_items = sorted(receipt.items, key=lambda item: item.created_at)
             for index, item in enumerate(sorted_items, 1):
@@ -643,6 +645,49 @@ def prepare_chargeable_items(
     if not prepared:
         raise ReceiptValidationError("В чеке не найдено оплаченных позиций")
     return prepared, list(dict.fromkeys(uncertain_names))
+
+
+def is_seven_eleven_merchant(merchant: str | None) -> bool:
+    if not merchant:
+        return False
+    normalized = merchant.casefold()
+    if "เซเว่น" in normalized:
+        return True
+    compact = "".join(character for character in normalized if character.isalnum())
+    return any(marker in compact for marker in ("7eleven", "seveneleven", "711", "cpall"))
+
+
+def prepare_receipt_items(
+    items: list[ExtractedItem],
+    merchant: str | None,
+    categories: dict[str, Category],
+    subcategories: dict[str, Subcategory],
+    confidence_threshold: float,
+) -> tuple[list[ExtractedItem], list[str]]:
+    """Route every paid 7-Eleven row to its dedicated envelope."""
+    if not is_seven_eleven_merchant(merchant):
+        return prepare_chargeable_items(
+            items,
+            categories,
+            subcategories,
+            confidence_threshold,
+        )
+    if SEVEN_ELEVEN_CATEGORY_KEY not in categories:
+        raise ReceiptValidationError("Не настроена категория 7-Eleven")
+
+    prepared = [
+        item.model_copy(
+            update={
+                "category_key": SEVEN_ELEVEN_CATEGORY_KEY,
+                "subcategory_key": None,
+            }
+        )
+        for item in items
+        if item.line_total > 0
+    ]
+    if not prepared:
+        raise ReceiptValidationError("В чеке не найдено оплаченных позиций")
+    return prepared, []
 
 
 def allocate_receipt_total(

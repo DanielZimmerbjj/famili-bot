@@ -139,6 +139,15 @@ async def seed_household(
         session.add(household)
         await session.flush()
 
+    open_cycles = (
+        await session.scalars(
+            select(BudgetCycle).where(
+                BudgetCycle.household_id == household.id,
+                BudgetCycle.status == "open",
+            )
+        )
+    ).all()
+
     member_specs = (
         (owner_user_id, "owner"),
         (member_user_id, "member"),
@@ -174,6 +183,22 @@ async def seed_household(
             )
             session.add(category)
             await session.flush()
+        for cycle in open_cycles:
+            allocation = await session.scalar(
+                select(BudgetAllocation.id).where(
+                    BudgetAllocation.cycle_id == cycle.id,
+                    BudgetAllocation.category_id == category.id,
+                )
+            )
+            if allocation is None:
+                session.add(
+                    BudgetAllocation(
+                        cycle_id=cycle.id,
+                        category_id=category.id,
+                        amount=category.default_limit,
+                        currency=category.envelope_currency,
+                    )
+                )
         for subcategory_key in template.subcategories:
             existing_subcategory = await session.scalar(
                 select(Subcategory).where(
