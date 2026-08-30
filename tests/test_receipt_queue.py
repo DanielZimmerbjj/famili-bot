@@ -6,7 +6,7 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from family_bot.config import Settings
-from family_bot.models import Base, Receipt
+from family_bot.models import Base, Receipt, ReceiptImage
 from family_bot.services.cycles import get_current_cycle, seed_default_household
 from family_bot.services.receipts import ReceiptService, ReceiptWorker
 
@@ -31,7 +31,7 @@ async def test_album_pages_are_added_without_being_reported_as_duplicates() -> N
         assert household is not None
         cycle = await get_current_cycle(session, household, date(2026, 8, 29), 5)
         service = ReceiptService(settings)
-        first, first_receipt, first_image = await service.enqueue(
+        first = await service.enqueue(
             session=session,
             household=household,
             cycle_id=cycle.id,
@@ -43,7 +43,7 @@ async def test_album_pages_are_added_without_being_reported_as_duplicates() -> N
             mime_type="image/jpeg",
             media_group_id="album",
         )
-        second, second_receipt, second_image = await service.enqueue(
+        second = await service.enqueue(
             session=session,
             household=household,
             cycle_id=cycle.id,
@@ -55,7 +55,7 @@ async def test_album_pages_are_added_without_being_reported_as_duplicates() -> N
             mime_type="image/jpeg",
             media_group_id="album",
         )
-        duplicate, duplicate_receipt, duplicate_image = await service.enqueue(
+        duplicate = await service.enqueue(
             session=session,
             household=household,
             cycle_id=cycle.id,
@@ -67,10 +67,101 @@ async def test_album_pages_are_added_without_being_reported_as_duplicates() -> N
             mime_type="image/jpeg",
             media_group_id="album",
         )
-        assert first.id == second.id == duplicate.id
-        assert (first_receipt, first_image) == (True, True)
-        assert (second_receipt, second_image) == (False, True)
-        assert (duplicate_receipt, duplicate_image) == (False, False)
+        assert first.receipt.id == second.receipt.id == duplicate.receipt.id
+        assert first.outcome == "created"
+        assert second.outcome == "page_added"
+        assert duplicate.outcome == "already_queued"
+    await engine.dispose()
+
+
+async def test_resending_failed_receipt_requeues_it_and_updates_reply_target() -> None:
+    engine, factory, settings = await queue_context()
+    async with factory() as session, session.begin():
+        household = await seed_default_household(session, settings)
+        assert household is not None
+        cycle = await get_current_cycle(session, household, date(2026, 8, 29), 5)
+        service = ReceiptService(settings)
+        first = await service.enqueue(
+            session=session,
+            household=household,
+            cycle_id=cycle.id,
+            chat_id=-100123,
+            message_id=20,
+            user_id=42,
+            file_id="old-file",
+            file_unique_id="same-image",
+            mime_type="image/jpeg",
+            media_group_id=None,
+        )
+        first.receipt.status = "failed"
+        first.receipt.retry_count = settings.receipt_retry_limit
+        first.receipt.error_message = "old extraction error"
+
+        repeated = await service.enqueue(
+            session=session,
+            household=household,
+            cycle_id=cycle.id,
+            chat_id=-100123,
+            message_id=21,
+            user_id=99,
+            file_id="fresh-file-id",
+            file_unique_id="same-image",
+            mime_type="image/jpeg",
+            media_group_id=None,
+        )
+
+        assert repeated.receipt.id == first.receipt.id
+        assert repeated.outcome == "requeued"
+        assert repeated.receipt.status == "retrying"
+        assert repeated.receipt.retry_count == 0
+        assert repeated.receipt.error_message is None
+        assert repeated.receipt.telegram_message_id == 21
+        assert repeated.receipt.created_by_user_id == 99
+        saved_image = await session.scalar(
+            select(ReceiptImage).where(ReceiptImage.receipt_id == repeated.receipt.id)
+        )
+        assert saved_image is not None
+        assert saved_image.telegram_file_id == "fresh-file-id"
+    await engine.dispose()
+
+
+async def test_resending_posted_receipt_never_requeues_or_double_posts() -> None:
+    engine, factory, settings = await queue_context()
+    async with factory() as session, session.begin():
+        household = await seed_default_household(session, settings)
+        assert household is not None
+        cycle = await get_current_cycle(session, household, date(2026, 8, 29), 5)
+        service = ReceiptService(settings)
+        first = await service.enqueue(
+            session=session,
+            household=household,
+            cycle_id=cycle.id,
+            chat_id=-100123,
+            message_id=30,
+            user_id=42,
+            file_id="posted-file",
+            file_unique_id="posted-image",
+            mime_type="image/jpeg",
+            media_group_id=None,
+        )
+        first.receipt.status = "posted"
+
+        repeated = await service.enqueue(
+            session=session,
+            household=household,
+            cycle_id=cycle.id,
+            chat_id=-100123,
+            message_id=31,
+            user_id=42,
+            file_id="posted-file-new-id",
+            file_unique_id="posted-image",
+            mime_type="image/jpeg",
+            media_group_id=None,
+        )
+
+        assert repeated.outcome == "already_posted"
+        assert repeated.receipt.status == "posted"
+        assert repeated.receipt.telegram_message_id == 30
     await engine.dispose()
 
 

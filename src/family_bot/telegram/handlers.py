@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 import re
 from collections import defaultdict
 from dataclasses import dataclass
@@ -10,7 +11,7 @@ from html import escape
 from io import BytesIO
 
 from aiogram import F, Router
-from aiogram.types import BufferedInputFile, CallbackQuery, Message
+from aiogram.types import BufferedInputFile, CallbackQuery, ErrorEvent, Message
 from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
@@ -53,6 +54,7 @@ from family_bot.services.ledger import (
 )
 from family_bot.services.money import CurrencyError, normalize_currency, quantize
 from family_bot.services.rates import RateService, RateUnavailableError
+from family_bot.services.receipt_images import infer_document_image_mime
 from family_bot.services.receipts import ReceiptService, format_money
 from family_bot.services.reports import build_chart, build_report
 from family_bot.services.text_parser import match_category
@@ -115,6 +117,8 @@ HELP_COMMAND_RE = simple_command_pattern(
     "start", "help", "помощь", plain=("помощь", "❓ Помощь")
 )
 CLOSE_COMMAND_RE = simple_command_pattern("close", "rollover", "закрыть")
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass(slots=True)
@@ -242,38 +246,63 @@ def build_router(deps: TelegramDependencies) -> Router:
             file_id = file.file_id
             file_unique_id = file.file_unique_id
             mime_type = "image/jpeg"
-        elif message.document and (message.document.mime_type or "").startswith("image/"):
+        elif message.document and (
+            inferred_mime := infer_document_image_mime(
+                message.document.mime_type,
+                message.document.file_name,
+            )
+        ):
             file_id = message.document.file_id
             file_unique_id = message.document.file_unique_id
-            mime_type = message.document.mime_type or "image/jpeg"
+            mime_type = inferred_mime
         else:
             await message.reply("Пришлите чек фотографией или изображением-файлом.")
             return
 
-        local_now = datetime.now(deps.settings.timezone)
-        async with deps.session_factory() as session, session.begin():
-            cycle = await get_current_cycle(
-                session,
-                household,
-                local_now.date(),
-                deps.settings.financial_cycle_start_day,
-            )
-            receipt, is_new_receipt, image_added = await deps.receipt_service.enqueue(
-                session=session,
-                household=household,
-                cycle_id=cycle.id,
-                chat_id=message.chat.id,
-                message_id=message.message_id,
-                user_id=user_id,
-                file_id=file_id,
-                file_unique_id=file_unique_id,
-                mime_type=mime_type,
-                media_group_id=message.media_group_id,
-            )
-        if is_new_receipt:
-            await message.reply(f"⏳ Чек принят, разбираю · <code>{receipt.id[:8]}</code>")
-        elif not image_added:
-            await message.reply("ℹ️ Это изображение уже есть в очереди или было обработано.")
+        progress = await message.reply("📥 Фото чека получил, ставлю в обработку…")
+        try:
+            local_now = datetime.now(deps.settings.timezone)
+            async with deps.session_factory() as session, session.begin():
+                cycle = await get_current_cycle(
+                    session,
+                    household,
+                    local_now.date(),
+                    deps.settings.financial_cycle_start_day,
+                )
+                result = await deps.receipt_service.enqueue(
+                    session=session,
+                    household=household,
+                    cycle_id=cycle.id,
+                    chat_id=message.chat.id,
+                    message_id=message.message_id,
+                    user_id=user_id,
+                    file_id=file_id,
+                    file_unique_id=file_unique_id,
+                    mime_type=mime_type,
+                    media_group_id=message.media_group_id,
+                )
+            if result.outcome == "created":
+                response = f"⏳ Чек принят, разбираю · <code>{result.receipt.id[:8]}</code>"
+            elif result.outcome == "page_added":
+                response = f"📄 Страница чека добавлена · <code>{result.receipt.id[:8]}</code>"
+            elif result.outcome == "requeued":
+                response = (
+                    "🔄 Прошлая обработка этого чека не завершилась. "
+                    f"Запускаю заново · <code>{result.receipt.id[:8]}</code>"
+                )
+            elif result.outcome == "already_posted":
+                response = "ℹ️ Этот чек уже учтён. Повторно расход не списываю."
+            else:
+                response = "⏳ Этот чек уже находится в обработке."
+            await progress.edit_text(response)
+        except Exception:
+            logger.exception("Could not enqueue Telegram receipt")
+            try:
+                await progress.edit_text(
+                    "❌ Не удалось поставить чек в обработку. Попробуйте отправить ещё раз."
+                )
+            except Exception:
+                logger.exception("Could not notify Telegram about receipt enqueue failure")
 
     @router.message(F.text.regexp(BALANCE_COMMAND_RE))
     async def balance(message: Message) -> None:
@@ -776,6 +805,20 @@ def build_router(deps: TelegramDependencies) -> Router:
                 )
                 await callback.answer()
                 await callback.message.reply("\n".join(lines))
+
+    @router.error()
+    async def unexpected_update_error(event: ErrorEvent) -> bool:
+        logger.exception("Unhandled Telegram update error", exc_info=event.exception)
+        message = event.update.message
+        if message is not None:
+            try:
+                await message.reply(
+                    "❌ Не смог обработать это сообщение из-за внутренней ошибки. "
+                    "Сообщение не потеряно; отправьте его ещё раз."
+                )
+            except Exception:
+                logger.exception("Could not notify Telegram about update failure")
+        return True
 
     return router
 

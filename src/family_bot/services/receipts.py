@@ -5,6 +5,7 @@ import hashlib
 import logging
 from collections import defaultdict
 from contextlib import suppress
+from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta, tzinfo
 from decimal import Decimal
 from html import escape
@@ -13,7 +14,7 @@ from pathlib import Path
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import func, select, update
+from sqlalchemy import delete, func, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
@@ -41,6 +42,7 @@ from family_bot.services.receipt_ai import (
     ReceiptExtractionError,
     ReceiptExtractor,
 )
+from family_bot.services.receipt_images import ReceiptImageError, normalize_receipt_image
 
 logger = logging.getLogger(__name__)
 
@@ -51,6 +53,12 @@ MAX_RECEIPT_FUTURE_SKEW = timedelta(days=1)
 
 class ReceiptValidationError(ValueError):
     pass
+
+
+@dataclass(frozen=True, slots=True)
+class ReceiptEnqueueResult:
+    receipt: Receipt
+    outcome: str
 
 
 def normalize_purchased_at(
@@ -101,7 +109,7 @@ class ReceiptService:
         file_unique_id: str,
         mime_type: str,
         media_group_id: str | None,
-    ) -> tuple[Receipt, bool, bool]:
+    ) -> ReceiptEnqueueResult:
         existing_image = await session.scalar(
             select(ReceiptImage).where(
                 ReceiptImage.telegram_file_unique_id == file_unique_id,
@@ -111,7 +119,31 @@ class ReceiptService:
             existing_receipt = await session.get(Receipt, existing_image.receipt_id)
             if existing_receipt is None:
                 raise RuntimeError("Receipt image points to a missing receipt")
-            return existing_receipt, False, False
+            if existing_receipt.status == "posted":
+                return ReceiptEnqueueResult(existing_receipt, "already_posted")
+            if existing_receipt.status in {"failed", "needs_review", "rate_pending", "reversed"}:
+                existing_receipt.cycle_id = cycle_id
+                existing_receipt.telegram_chat_id = chat_id
+                existing_receipt.telegram_message_id = message_id
+                existing_receipt.created_by_user_id = user_id
+                existing_receipt.status = "retrying"
+                existing_receipt.retry_count = 0
+                existing_receipt.next_attempt_at = utcnow()
+                existing_receipt.error_message = None
+                existing_receipt.merchant = None
+                existing_receipt.purchased_at = None
+                existing_receipt.original_currency = None
+                existing_receipt.original_total = None
+                existing_receipt.total_kzt = None
+                existing_receipt.exchange_rate_id = None
+                existing_receipt.model_name = None
+                existing_receipt.extraction = None
+                existing_receipt.overall_confidence = None
+                existing_receipt.posted_at = None
+                existing_image.telegram_file_id = file_id
+                existing_image.mime_type = mime_type
+                return ReceiptEnqueueResult(existing_receipt, "requeued")
+            return ReceiptEnqueueResult(existing_receipt, "already_queued")
 
         receipt: Receipt | None = None
         if media_group_id:
@@ -155,7 +187,7 @@ class ReceiptService:
             )
         )
         await session.flush()
-        return receipt, is_new, True
+        return ReceiptEnqueueResult(receipt, "created" if is_new else "page_added")
 
 
 class ReceiptWorker:
@@ -289,8 +321,10 @@ class ReceiptWorker:
             stream = BytesIO()
             await self.bot.download(image.telegram_file_id, destination=stream)
             data = stream.getvalue()
-            if not data:
-                raise ReceiptValidationError("Telegram вернул пустое изображение")
+            try:
+                normalized_data, normalized_mime, extension = normalize_receipt_image(data)
+            except ReceiptImageError as exc:
+                raise ReceiptValidationError(str(exc)) from exc
             digest = hashlib.sha256(data).hexdigest()
             duplicate = await session.scalar(
                 select(ReceiptImage).where(
@@ -299,13 +333,17 @@ class ReceiptWorker:
                 )
             )
             if duplicate is not None:
-                raise ReceiptValidationError("Вероятный дубликат уже загруженного чека")
-            extension = ".png" if image.mime_type == "image/png" else ".jpg"
+                duplicate_receipt = await session.get(Receipt, duplicate.receipt_id)
+                if duplicate_receipt is not None and duplicate_receipt.status == "posted":
+                    raise ReceiptValidationError(
+                        "Этот чек уже был учтён ранее; повторно расход не списан"
+                    )
             path = storage_dir / f"{image.page_order + 1}{extension}"
-            path.write_bytes(data)
+            path.write_bytes(normalized_data)
             image.sha256 = digest
             image.storage_path = str(path)
-            payloads.append((data, image.mime_type))
+            image.mime_type = normalized_mime
+            payloads.append((normalized_data, normalized_mime))
         await session.flush()
         return payloads
 
@@ -393,6 +431,7 @@ class ReceiptWorker:
 
         grouped: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
         source_rate = await self.rate_service.get_quote(session, currency, purchased_at.date())
+        await session.execute(delete(ReceiptItem).where(ReceiptItem.receipt_id == receipt.id))
         for item, allocated_total in zip(items, allocated_totals, strict=True):
             category = categories[item.category_key]
             subcategory = None

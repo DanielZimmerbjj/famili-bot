@@ -111,6 +111,38 @@ def test_seven_eleven_receipt_uses_only_dedicated_category() -> None:
     assert uncertain == []
 
 
+def test_exact_124_baht_seven_eleven_receipt_posts_seven_paid_rows() -> None:
+    source_items = [
+        item("เนสท์เล่ ลาเต้", "15"),
+        item("แซนวิชครีมซองเห็ด", "35"),
+        item("Hกระเทียมปรุงรส", "15"),
+        item("หมากฝรั่ง", "15"),
+        item("เดลฟี่คุกกี้ช็อกโกแลต", "24"),
+        item("เดลฟี่คุกกี้ช็อกโกแลต", "24"),
+        item("H.เกลือ", "10"),
+        item("แสตมป์ 1 บาท", "0"),
+    ]
+
+    prepared, uncertain = prepare_receipt_items(
+        source_items,
+        "CP ALL, 7-Eleven",
+        categories={"seven_eleven": object()},  # type: ignore[dict-item]
+        subcategories={},
+        confidence_threshold=0.75,
+    )
+    allocations = allocate_receipt_total(
+        prepared,
+        total=Decimal("124"),
+        discount=Decimal("14"),
+        tax=Decimal("0"),
+    )
+
+    assert len(prepared) == 7
+    assert uncertain == []
+    assert sum(allocations) == Decimal("124.00000000")
+    assert {prepared_item.category_key for prepared_item in prepared} == {"seven_eleven"}
+
+
 @pytest.mark.parametrize(
     "merchant",
     ("7-Eleven", "7 Eleven Thailand", "7-11", "CP ALL Public Company", "เซเว่น อีเลฟเว่น"),
