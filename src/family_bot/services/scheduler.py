@@ -11,8 +11,9 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from family_bot.config import Settings
-from family_bot.models import Household, ScheduledRun, utcnow
+from family_bot.models import BudgetCycle, Household, SavingsGoal, ScheduledRun, utcnow
 from family_bot.services.cycles import get_current_cycle
+from family_bot.services.ledger import cycle_cash_remainder_kzt
 from family_bot.services.rates import RateService
 from family_bot.services.reports import build_report
 from family_bot.telegram.keyboards import cycle_close_keyboard, main_menu_keyboard
@@ -101,11 +102,46 @@ class ReportScheduler:
                 text,
                 reply_markup=main_menu_keyboard(),
             )
-            if now.date() >= cycle.end_date and cycle.status == "open":
+            cycle_to_close = await session.scalar(
+                select(BudgetCycle)
+                .where(
+                    BudgetCycle.household_id == household.id,
+                    BudgetCycle.status == "open",
+                    BudgetCycle.end_date <= now.date(),
+                )
+                .order_by(BudgetCycle.end_date)
+            )
+            if cycle_to_close is not None:
+                amount = await cycle_cash_remainder_kzt(session, cycle_to_close.id)
+                goals = (
+                    await session.scalars(
+                        select(SavingsGoal)
+                        .where(
+                            SavingsGoal.household_id == household.id,
+                            SavingsGoal.active.is_(True),
+                        )
+                        .order_by(SavingsGoal.goal_type, SavingsGoal.name)
+                    )
+                ).all()
+                goal_options = [(goal.id, goal.name, goal.icon) for goal in goals]
                 await self.bot.send_message(
                     household.telegram_chat_id,
-                    "Финансовый месяц завершён. Куда направить остаток?",
-                    reply_markup=cycle_close_keyboard(cycle.id),
+                    (
+                        "Финансовый месяц завершён. "
+                        "Свободный остаток: "
+                        f"<b>{f'{amount:,.0f}'.replace(',', ' ')} ₸</b>. "
+                        "Куда его направить?"
+                        if amount
+                        else (
+                            "Финансовый месяц завершён. "
+                            "Свободного остатка для переноса нет."
+                        )
+                    ),
+                    reply_markup=cycle_close_keyboard(
+                        cycle_to_close.id,
+                        goal_options,
+                        has_remainder=bool(amount),
+                    ),
                 )
             run.status = "completed"
             run.completed_at = utcnow()

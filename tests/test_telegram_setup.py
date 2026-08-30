@@ -8,10 +8,12 @@ from family_bot.config import Settings
 from family_bot.models import Base, BudgetCycle, Household, Member
 from family_bot.telegram.handlers import (
     BALANCE_COMMAND_RE,
+    CLOSE_COMMAND_RE,
     HELP_COMMAND_RE,
     SETUP_COMMAND_RE,
     authorize_message,
 )
+from family_bot.telegram.keyboards import cycle_close_keyboard
 
 
 class FakeMessage:
@@ -44,6 +46,38 @@ def test_other_simple_commands_accept_harmless_punctuation() -> None:
     assert HELP_COMMAND_RE.fullmatch("/start@zimmersfamili_bot!")
     assert BALANCE_COMMAND_RE.fullmatch("💰 Баланс")
     assert not SETUP_COMMAND_RE.fullmatch("/setup now")
+
+
+@pytest.mark.parametrize(
+    "text",
+    (
+        "/close",
+        "закрой месяц",
+        "месяц закончен",
+        "всё, месяц закончен!",
+    ),
+)
+def test_close_month_accepts_text_and_voice_style_phrases(text: str) -> None:
+    assert CLOSE_COMMAND_RE.fullmatch(text)
+
+
+def test_close_month_keyboard_lists_every_goal_with_short_callbacks() -> None:
+    keyboard = cycle_close_keyboard(
+        "12345678-1234-1234-1234-123456789abc",
+        [
+            ("aaaaaaaa-1234-1234-1234-123456789abc", "Автомобиль", "🚙"),
+            ("bbbbbbbb-1234-1234-1234-123456789abc", "MacBook", "🎯"),
+        ],
+    )
+
+    assert [row[0].text for row in keyboard.inline_keyboard] == [
+        "🚙 Переложить всё в «Автомобиль»",
+        "🎯 Переложить всё в «MacBook»",
+        "🧰 Оставить остаток резервом",
+    ]
+    assert all(
+        len(row[0].callback_data or "") <= 64 for row in keyboard.inline_keyboard
+    )
 
 
 async def test_owner_first_group_message_automatically_seeds_budget() -> None:

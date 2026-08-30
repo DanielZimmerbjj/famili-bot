@@ -19,18 +19,41 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
     )
 
 
-def cycle_close_keyboard(cycle_id: str) -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
+def _callback_token(value: str) -> str:
+    return value.replace("-", "")[:8]
+
+
+def cycle_close_keyboard(
+    cycle_id: str,
+    goals: list[tuple[str, str, str]],
+    *,
+    has_remainder: bool = True,
+) -> InlineKeyboardMarkup:
+    cycle_token = _callback_token(cycle_id)
+    rows: list[list[InlineKeyboardButton]] = []
+    if has_remainder:
+        rows.extend(
             [
                 InlineKeyboardButton(
-                    text="🚙 Добавить к машине",
-                    callback_data=f"cycle:rollover:{cycle_id}",
-                ),
-                InlineKeyboardButton(
-                    text="🧰 Оставить резервом",
-                    callback_data=f"cycle:keep:{cycle_id}",
-                ),
+                    text=f"{icon} Переложить всё в «{name}»",
+                    callback_data=(
+                        f"cycle:goal:{cycle_token}:{_callback_token(goal_id)}"
+                    ),
+                )
             ]
+            for goal_id, name, icon in goals
+        )
+    keep_label = (
+        "🧰 Оставить остаток резервом"
+        if has_remainder
+        else "✅ Закрыть месяц без переноса"
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text=keep_label,
+                callback_data=f"cycle:keep:{cycle_token}",
+            )
         ]
     )
+    return InlineKeyboardMarkup(inline_keyboard=rows)

@@ -44,7 +44,7 @@ from family_bot.services.expense_ai import (
 from family_bot.services.ledger import (
     PostedEntry,
     allocation_and_spend,
-    cycle_rollover_kzt,
+    cycle_cash_remainder_kzt,
     get_category,
     goal_balance,
     post_expense,
@@ -116,7 +116,24 @@ GOAL_COMMAND_RE = simple_command_pattern(
 HELP_COMMAND_RE = simple_command_pattern(
     "start", "help", "помощь", plain=("помощь", "❓ Помощь")
 )
-CLOSE_COMMAND_RE = simple_command_pattern("close", "rollover", "закрыть")
+CLOSE_COMMAND_RE = simple_command_pattern(
+    "close",
+    "rollover",
+    "закрыть",
+    plain=(
+        "закрыть",
+        "закрыть месяц",
+        "закрой месяц",
+        "завершить месяц",
+        "заверши месяц",
+        "месяц закончен",
+        "месяц закончился",
+        "все, месяц закончен",
+        "всё, месяц закончен",
+        "все месяц закончен",
+        "всё месяц закончен",
+    ),
+)
 
 logger = logging.getLogger(__name__)
 
@@ -231,6 +248,12 @@ def build_router(deps: TelegramDependencies) -> Router:
                 mime_type=message.voice.mime_type or "audio/ogg",
             )
             await progress.edit_text(f"📝 Распознал: <i>{escape(transcript)}</i>")
+            if CLOSE_COMMAND_RE.fullmatch(transcript.strip()):
+                if user_id != deps.settings.telegram_owner_user_id:
+                    await message.reply("Закрыть месяц может только владелец.")
+                    return
+                await prompt_cycle_close(message, deps, household)
+                return
             await handle_natural_operation(message, deps, household, user_id, transcript)
         except Exception as exc:
             await message.reply(f"❌ Не удалось обработать голосовое: {escape(str(exc))}")
@@ -503,39 +526,7 @@ def build_router(deps: TelegramDependencies) -> Router:
         if authorization is None:
             return
         household, _ = authorization
-        local_now = datetime.now(deps.settings.timezone)
-        try:
-            async with deps.session_factory() as session:
-                cycle = await get_current_cycle(
-                    session,
-                    household,
-                    local_now.date(),
-                    deps.settings.financial_cycle_start_day,
-                )
-                if cycle.status == "closed":
-                    await message.reply("Этот финансовый месяц уже закрыт.")
-                    return
-                if local_now.date() < cycle.end_date:
-                    await message.reply(
-                        f"Закрыть месяц можно {cycle.end_date.strftime('%d.%m.%Y')}."
-                    )
-                    return
-                pending = await pending_receipt_count(session, cycle.id)
-                if pending:
-                    await message.reply(
-                        f"Сначала разберите {pending} чек(а/ов), которые ещё не проведены."
-                    )
-                    return
-                amount = await cycle_rollover_kzt(
-                    session, deps.rate_service, cycle.id, local_now.date()
-                )
-                await session.commit()
-            await message.reply(
-                f"В категориях осталось ≈ <b>{format_money(amount)} ₸</b>. Куда его направить?",
-                reply_markup=cycle_close_keyboard(cycle.id),
-            )
-        except RateUnavailableError:
-            await message.reply("Не удалось рассчитать остаток: нет курса к тенге.")
+        await prompt_cycle_close(message, deps, household)
 
     @router.message(F.text.regexp(FIX_RE))
     async def fix_item(message: Message) -> None:
@@ -659,31 +650,35 @@ def build_router(deps: TelegramDependencies) -> Router:
         if callback.from_user.id != deps.settings.telegram_owner_user_id:
             await callback.answer("Закрыть месяц может только владелец.", show_alert=True)
             return
-        _, action, cycle_id = callback.data.split(":", 2)
-        if action not in {"rollover", "keep"}:
+        parts = callback.data.split(":")
+        action = parts[1] if len(parts) >= 2 else ""
+        if action == "goal" and len(parts) == 4:
+            cycle_reference, goal_reference = parts[2], parts[3]
+        elif action in {"rollover", "keep"} and len(parts) == 3:
+            cycle_reference = parts[2]
+            goal_reference = "car" if action == "rollover" else None
+        else:
             await callback.answer("Неизвестное действие.", show_alert=True)
             return
         local_now = datetime.now(deps.settings.timezone)
         amount = Decimal("0")
+        destination_goal: SavingsGoal | None = None
         try:
             async with deps.session_factory() as session, session.begin():
                 household = await get_household_by_chat(session, callback.message.chat.id)
                 if household is None:
                     await callback.answer("Семья не найдена.", show_alert=True)
                     return
-                cycle = await session.scalar(
-                    select(BudgetCycle)
-                    .where(
-                        BudgetCycle.id == cycle_id,
-                        BudgetCycle.household_id == household.id,
-                    )
-                    .with_for_update()
+                cycle = await resolve_open_cycle_reference(
+                    session,
+                    household.id,
+                    cycle_reference,
                 )
                 if cycle is None:
-                    await callback.answer("Месяц не найден.", show_alert=True)
-                    return
-                if cycle.status == "closed":
-                    await callback.answer("Месяц уже закрыт.", show_alert=True)
+                    await callback.answer(
+                        "Месяц не найден или уже закрыт.",
+                        show_alert=True,
+                    )
                     return
                 if local_now.date() < cycle.end_date:
                     await callback.answer("Ещё рано закрывать этот месяц.", show_alert=True)
@@ -692,24 +687,36 @@ def build_router(deps: TelegramDependencies) -> Router:
                 if pending:
                     await callback.answer(f"Есть непроведённые чеки: {pending}.", show_alert=True)
                     return
-                if action == "rollover":
-                    amount = await cycle_rollover_kzt(
-                        session, deps.rate_service, cycle.id, local_now.date()
+                amount = await cycle_cash_remainder_kzt(session, cycle.id)
+                if action in {"goal", "rollover"}:
+                    destination_goal = await resolve_active_goal_reference(
+                        session,
+                        household.id,
+                        goal_reference,
                     )
-                    if amount:
-                        await post_goal_contribution(
-                            session,
-                            deps.rate_service,
-                            household,
-                            cycle,
-                            "car",
-                            amount,
-                            "KZT",
-                            local_now,
-                            callback.from_user.id,
+                    if destination_goal is None:
+                        await callback.answer("Цель не найдена.", show_alert=True)
+                        return
+                    if not amount:
+                        await callback.answer(
+                            "Свободного остатка для переноса нет.",
+                            show_alert=True,
                         )
+                        return
+                    await post_goal_contribution(
+                        session,
+                        deps.rate_service,
+                        household,
+                        cycle,
+                        destination_goal.key,
+                        amount,
+                        "KZT",
+                        local_now,
+                        callback.from_user.id,
+                    )
                 cycle.status = "closed"
                 cycle.closed_at = local_now.astimezone(UTC)
+                destination = destination_goal.key if destination_goal else "reserve"
                 session.add(
                     AuditLog(
                         household_id=household.id,
@@ -720,8 +727,9 @@ def build_router(deps: TelegramDependencies) -> Router:
                         before_data={"status": "open"},
                         after_data={
                             "status": "closed",
-                            "rollover_kzt": str(amount),
-                            "destination": "car" if action == "rollover" else "reserve",
+                            "remainder_kzt": str(amount),
+                            "rollover_kzt": str(amount if destination_goal else Decimal("0")),
+                            "destination": destination,
                         },
                     )
                 )
@@ -730,12 +738,16 @@ def build_router(deps: TelegramDependencies) -> Router:
             return
         await callback.answer("Месяц закрыт")
         await callback.message.edit_reply_markup(reply_markup=None)
-        if action == "rollover":
+        if destination_goal is not None:
             await callback.message.reply(
-                f"✅ {format_money(amount)} ₸ добавлено к цели «Автомобиль»."
+                f"✅ {format_money(amount)} ₸ перенесено в «{escape(destination_goal.name)}». "
+                "Месяц закрыт, история сохранена."
             )
         else:
-            await callback.message.reply("✅ Месяц закрыт, остаток оставлен резервом.")
+            await callback.message.reply(
+                f"✅ Месяц закрыт. {format_money(amount)} ₸ "
+                "оставлено свободным резервом."
+            )
 
     @router.callback_query(F.data.startswith("receipt:"))
     async def receipt_callback(callback: CallbackQuery) -> None:
@@ -821,6 +833,131 @@ def build_router(deps: TelegramDependencies) -> Router:
         return True
 
     return router
+
+
+def compact_callback_reference(value: str) -> str:
+    return value.replace("-", "").casefold()
+
+
+async def resolve_open_cycle_reference(
+    session: AsyncSession,
+    household_id: str,
+    reference: str,
+) -> BudgetCycle | None:
+    normalized = compact_callback_reference(reference)
+    cycles = (
+        await session.scalars(
+            select(BudgetCycle)
+            .where(
+                BudgetCycle.household_id == household_id,
+                BudgetCycle.status == "open",
+            )
+            .with_for_update()
+        )
+    ).all()
+    matches = [
+        cycle
+        for cycle in cycles
+        if compact_callback_reference(cycle.id).startswith(normalized)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+async def resolve_active_goal_reference(
+    session: AsyncSession,
+    household_id: str,
+    reference: str | None,
+) -> SavingsGoal | None:
+    if not reference:
+        return None
+    goals = (
+        await session.scalars(
+            select(SavingsGoal).where(
+                SavingsGoal.household_id == household_id,
+                SavingsGoal.active.is_(True),
+            )
+        )
+    ).all()
+    normalized = compact_callback_reference(reference)
+    matches = [
+        goal
+        for goal in goals
+        if goal.key.casefold() == reference.casefold()
+        or compact_callback_reference(goal.id).startswith(normalized)
+    ]
+    return matches[0] if len(matches) == 1 else None
+
+
+async def prompt_cycle_close(
+    message: Message,
+    deps: TelegramDependencies,
+    household: Household,
+) -> None:
+    local_now = datetime.now(deps.settings.timezone)
+    async with deps.session_factory() as session, session.begin():
+        cycle = await session.scalar(
+            select(BudgetCycle)
+            .where(
+                BudgetCycle.household_id == household.id,
+                BudgetCycle.status == "open",
+                BudgetCycle.end_date <= local_now.date(),
+            )
+            .order_by(BudgetCycle.end_date)
+        )
+        if cycle is None:
+            current_cycle = await get_current_cycle(
+                session,
+                household,
+                local_now.date(),
+                deps.settings.financial_cycle_start_day,
+            )
+            if current_cycle.status == "closed":
+                await message.reply("Этот финансовый месяц уже закрыт.")
+            else:
+                await message.reply(
+                    f"Закрыть текущий месяц можно "
+                    f"{current_cycle.end_date.strftime('%d.%m.%Y')}."
+                )
+            return
+        pending = await pending_receipt_count(session, cycle.id)
+        if pending:
+            await message.reply(
+                f"Сначала разберите {pending} чек(а/ов), которые ещё не проведены."
+            )
+            return
+        amount = await cycle_cash_remainder_kzt(session, cycle.id)
+        goals = (
+            await session.scalars(
+                select(SavingsGoal)
+                .where(
+                    SavingsGoal.household_id == household.id,
+                    SavingsGoal.active.is_(True),
+                )
+                .order_by(SavingsGoal.goal_type, SavingsGoal.name)
+            )
+        ).all()
+
+    goal_options = [(goal.id, goal.name, goal.icon) for goal in goals]
+    if amount:
+        text = (
+            f"💰 Фактический свободный остаток: "
+            f"<b>{format_money(amount)} ₸</b>.\n"
+            "Расчёт: все поступления минус расходы и уже сделанные "
+            "переводы в накопления.\n\nКуда переложить весь остаток?"
+        )
+    else:
+        text = (
+            "💰 Свободного остатка для переноса нет. "
+            "Месяц можно закрыть без пополнения целей."
+        )
+    await message.reply(
+        text,
+        reply_markup=cycle_close_keyboard(
+            cycle.id,
+            goal_options,
+            has_remainder=bool(amount),
+        ),
+    )
 
 
 async def handle_natural_operation(

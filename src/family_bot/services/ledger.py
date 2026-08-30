@@ -286,3 +286,38 @@ async def cycle_rollover_kzt(
         quote = await rate_service.get_quote(session, category.envelope_currency, on_date)
         total += quote.to_kzt(remaining)
     return quantize(total)
+
+
+async def cycle_cash_remainder_kzt(
+    session: AsyncSession,
+    cycle_id: str,
+) -> Decimal:
+    """Return money that is still free at the end of a financial cycle.
+
+    Income increases the free balance. Posted expenses and transfers that were
+    already made into savings decrease it. Goal expenses are intentionally not
+    included: they are paid from a separate savings balance, not from the
+    current month's free cash.
+    """
+
+    amount = await session.scalar(
+        select(
+            func.coalesce(
+                func.sum(
+                    case(
+                        (LedgerEntry.entry_type == "income", LedgerEntry.amount_kzt),
+                        (
+                            LedgerEntry.entry_type.in_(("expense", "goal_contribution")),
+                            -LedgerEntry.amount_kzt,
+                        ),
+                        else_=0,
+                    )
+                ),
+                0,
+            )
+        ).where(
+            LedgerEntry.cycle_id == cycle_id,
+            LedgerEntry.status == "posted",
+        )
+    )
+    return quantize(max(Decimal(amount or 0), Decimal("0")))
