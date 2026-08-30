@@ -31,6 +31,14 @@ class PostedEntry:
     envelope_rate: RateQuote | None
 
 
+@dataclass(frozen=True, slots=True)
+class CycleCloseBreakdown:
+    gross_remainder_kzt: Decimal
+    mandatory_reserved_kzt: Decimal
+    border_contribution_kzt: Decimal
+    transferable_kzt: Decimal
+
+
 async def get_category(session: AsyncSession, household_id: str, key: str) -> Category:
     category = await session.scalar(
         select(Category).where(
@@ -56,6 +64,8 @@ async def post_expense(
     occurred_at: datetime,
     user_id: int | None,
     receipt_id: str | None = None,
+    source_event_key: str | None = None,
+    source_item_index: int | None = None,
 ) -> PostedEntry:
     if amount <= 0:
         raise LedgerError("Expense amount must be positive")
@@ -80,6 +90,8 @@ async def post_expense(
         exchange_rate_id=source_rate.rate_id,
         occurred_at=occurred_at,
         created_by_user_id=user_id,
+        source_event_key=source_event_key,
+        source_item_index=source_item_index,
     )
     session.add(entry)
     await session.flush()
@@ -96,6 +108,8 @@ async def post_income(
     description: str,
     occurred_at: datetime,
     user_id: int | None,
+    source_event_key: str | None = None,
+    source_item_index: int | None = None,
 ) -> PostedEntry:
     if amount <= 0:
         raise LedgerError("Income amount must be positive")
@@ -114,6 +128,8 @@ async def post_income(
         exchange_rate_id=source_rate.rate_id,
         occurred_at=occurred_at,
         created_by_user_id=user_id,
+        source_event_key=source_event_key,
+        source_item_index=source_item_index,
     )
     session.add(entry)
     await session.flush()
@@ -133,7 +149,13 @@ async def match_income_source(
     ).all()
     if not sources:
         return None
-    return min(sources, key=lambda source: abs(Decimal(source.expected_amount) - amount_kzt))
+    closest = min(
+        sources,
+        key=lambda source: abs(Decimal(source.expected_amount) - amount_kzt),
+    )
+    expected = Decimal(closest.expected_amount)
+    tolerance = max(expected * Decimal("0.15"), Decimal("20000"))
+    return closest if abs(expected - amount_kzt) <= tolerance else None
 
 
 async def post_goal_contribution(
@@ -146,7 +168,11 @@ async def post_goal_contribution(
     currency: str,
     occurred_at: datetime,
     user_id: int | None,
+    source_event_key: str | None = None,
+    source_item_index: int | None = None,
 ) -> PostedEntry:
+    if amount <= 0:
+        raise LedgerError("Goal contribution must be positive")
     goal = await session.scalar(
         select(SavingsGoal).where(
             SavingsGoal.household_id == household.id,
@@ -170,6 +196,8 @@ async def post_goal_contribution(
         exchange_rate_id=source_rate.rate_id,
         occurred_at=occurred_at,
         created_by_user_id=user_id,
+        source_event_key=source_event_key,
+        source_item_index=source_item_index,
     )
     session.add(entry)
     await session.flush()
@@ -187,7 +215,11 @@ async def post_goal_expense(
     description: str,
     occurred_at: datetime,
     user_id: int | None,
+    source_event_key: str | None = None,
+    source_item_index: int | None = None,
 ) -> PostedEntry:
+    if amount <= 0:
+        raise LedgerError("Goal expense must be positive")
     goal = await session.scalar(
         select(SavingsGoal).where(
             SavingsGoal.household_id == household.id,
@@ -218,6 +250,8 @@ async def post_goal_expense(
         exchange_rate_id=source_rate.rate_id,
         occurred_at=occurred_at,
         created_by_user_id=user_id,
+        source_event_key=source_event_key,
+        source_item_index=source_item_index,
     )
     session.add(entry)
     await session.flush()
@@ -321,3 +355,44 @@ async def cycle_cash_remainder_kzt(
         )
     )
     return quantize(max(Decimal(amount or 0), Decimal("0")))
+
+
+async def cycle_close_breakdown(
+    session: AsyncSession,
+    cycle: BudgetCycle,
+) -> CycleCloseBreakdown:
+    """Split the real month-end cash into commitments and transferable money."""
+
+    gross = await cycle_cash_remainder_kzt(session, cycle.id)
+    mandatory = min(gross, max(Decimal(cycle.mandatory_kzt), Decimal("0")))
+    after_mandatory = max(gross - mandatory, Decimal("0"))
+
+    border_goal = await session.scalar(
+        select(SavingsGoal).where(
+            SavingsGoal.household_id == cycle.household_id,
+            SavingsGoal.key == "border_run",
+            SavingsGoal.active.is_(True),
+        )
+    )
+    contributed = Decimal("0")
+    if border_goal is not None:
+        contributed = Decimal(
+            await session.scalar(
+                select(func.coalesce(func.sum(LedgerEntry.amount_kzt), 0)).where(
+                    LedgerEntry.cycle_id == cycle.id,
+                    LedgerEntry.goal_id == border_goal.id,
+                    LedgerEntry.entry_type == "goal_contribution",
+                    LedgerEntry.status == "posted",
+                )
+            )
+            or 0
+        )
+    border_missing = max(Decimal(cycle.border_run_target_kzt) - contributed, Decimal("0"))
+    border_contribution = min(after_mandatory, border_missing)
+    transferable = max(after_mandatory - border_contribution, Decimal("0"))
+    return CycleCloseBreakdown(
+        gross_remainder_kzt=quantize(gross),
+        mandatory_reserved_kzt=quantize(mandatory),
+        border_contribution_kzt=quantize(border_contribution),
+        transferable_kzt=quantize(transferable),
+    )

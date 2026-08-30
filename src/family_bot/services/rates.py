@@ -81,6 +81,7 @@ class NbkClient:
 class RateService:
     def __init__(self, client: NbkClient | None = None) -> None:
         self.client = client or NbkClient()
+        self._effective_cache: dict[tuple[str, date], RateQuote] = {}
 
     async def get_quote(
         self, session: AsyncSession, currency: str, requested_date: date
@@ -102,7 +103,23 @@ class RateService:
         if manual is not None:
             return self._from_model(manual)
 
-        statement = (
+        cache_key = (currency, requested_date)
+        cached = self._effective_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
+        exact_statement = select(ExchangeRate).where(
+            ExchangeRate.currency == currency,
+            ExchangeRate.rate_date == requested_date,
+            ExchangeRate.provider == "NBK",
+        )
+        exact = await session.scalar(exact_statement)
+        if exact is not None:
+            quote = self._from_model(exact)
+            self._effective_cache[cache_key] = quote
+            return quote
+
+        fallback_statement = (
             select(ExchangeRate)
             .where(
                 ExchangeRate.currency == currency,
@@ -112,11 +129,15 @@ class RateService:
             .order_by(ExchangeRate.rate_date.desc())
             .limit(1)
         )
-        existing = await session.scalar(statement)
-        if existing is not None and (requested_date - existing.rate_date).days <= 7:
-            return self._from_model(existing)
-
-        fetched = await self.client.fetch(currency, requested_date)
+        fallback = await session.scalar(fallback_statement)
+        try:
+            fetched = await self.client.fetch(currency, requested_date)
+        except RateUnavailableError:
+            if fallback is not None and (requested_date - fallback.rate_date).days <= 7:
+                quote = self._from_model(fallback)
+                self._effective_cache[cache_key] = quote
+                return quote
+            raise
         statement = select(ExchangeRate).where(
             ExchangeRate.rate_date == fetched.rate_date,
             ExchangeRate.currency == fetched.currency,
@@ -141,7 +162,9 @@ class RateService:
                 existing = await session.scalar(statement)
                 if existing is None:
                     raise
-        return self._from_model(existing)
+        quote = self._from_model(existing)
+        self._effective_cache[cache_key] = quote
+        return quote
 
     @staticmethod
     def _from_model(rate: ExchangeRate) -> RateQuote:

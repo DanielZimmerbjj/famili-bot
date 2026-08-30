@@ -13,7 +13,11 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from family_bot.models import BudgetCycle, Household, LedgerEntry, Receipt, SavingsGoal
-from family_bot.services.ledger import allocation_and_spend, goal_balance
+from family_bot.services.ledger import (
+    allocation_and_spend,
+    cycle_close_breakdown,
+    goal_balance,
+)
 from family_bot.services.rates import RateService
 from family_bot.services.receipts import format_money
 
@@ -110,7 +114,7 @@ async def build_report(
         - cycle_spent_kzt
         - remaining_kzt
     )
-    car_gap = Decimal(cycle.car_target_kzt) - projected_car
+    close_breakdown = await cycle_close_breakdown(session, cycle)
 
     lines = [
         f"🌙 <b>Итоги за {local_date.strftime('%d.%m.%Y')}</b>",
@@ -136,20 +140,20 @@ async def build_report(
         [
             "",
             f"Всего: {format_money(total_spent)} / {format_money(total_limit)} ฿",
-            f"Осталось: <b>{format_money(total_remaining)} ฿</b> · "
+            f"По лимитам осталось: <b>{format_money(total_remaining)} ฿</b> · "
             f"≈ {format_money(remaining_kzt)} ₸",
             "",
             f"Доход получен: {format_money(income_received)} / "
             f"{format_money(cycle.expected_income_kzt)} ₸",
             f"Обязательства: {format_money(cycle.mandatory_kzt)} ₸",
-            f"Прогноз на автомобиль: <b>{format_money(projected_car)} ₸</b>",
+            f"Свободно сейчас: "
+            f"<b>{format_money(close_breakdown.transferable_kzt)} ₸</b>",
+            f"Плановый остаток на накопления: "
+            f"<b>{format_money(projected_car)} ₸</b>",
+            f"Ориентир на машину: {format_money(cycle.car_target_kzt)} ₸ "
+            "(не обязательный)",
         ]
     )
-    if car_gap > 0:
-        lines.append(
-            f"⚠️ До плана {format_money(cycle.car_target_kzt)} ₸ "
-            f"не хватает ≈ {format_money(car_gap)} ₸"
-        )
 
     goals = (
         await session.scalars(
@@ -161,7 +165,9 @@ async def build_report(
     for goal in goals:
         balance = await goal_balance(session, household.id, goal.id)
         target = Decimal(goal.target_amount)
-        if target > 0:
+        if goal.goal_type == "reserve":
+            progress = f"В резерве <b>{format_money(balance)} {goal.currency}</b>"
+        elif target > 0:
             remaining = max(target - balance, Decimal("0"))
             progress = (
                 f"[{progress_bar(balance, target)}] {format_money(balance)} / "
@@ -174,7 +180,7 @@ async def build_report(
                 "общая стоимость не задана"
             )
         lines.extend(["", f"{goal.icon} <b>{goal.name}</b>", progress])
-    if local_date >= cycle.end_date and cycle.status == "open":
+    if local_date > cycle.end_date and cycle.status == "open":
         lines.extend(
             [
                 "",

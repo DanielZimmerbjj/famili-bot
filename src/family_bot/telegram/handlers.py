@@ -13,6 +13,7 @@ from io import BytesIO
 from aiogram import F, Router
 from aiogram.types import BufferedInputFile, CallbackQuery, ErrorEvent, Message
 from sqlalchemy import func, select, update
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
@@ -44,7 +45,7 @@ from family_bot.services.expense_ai import (
 from family_bot.services.ledger import (
     PostedEntry,
     allocation_and_spend,
-    cycle_cash_remainder_kzt,
+    cycle_close_breakdown,
     get_category,
     goal_balance,
     post_expense,
@@ -476,7 +477,12 @@ def build_router(deps: TelegramDependencies) -> Router:
             lines = ["<b>Накопления</b>"]
             for goal in goal_models:
                 value = await goal_balance(session, household.id, goal.id)
-                if Decimal(goal.target_amount) > 0:
+                if goal.goal_type == "reserve":
+                    lines.append(
+                        f"{goal.icon} {escape(goal.name)}: "
+                        f"<b>{format_money(value)} {goal.currency}</b>"
+                    )
+                elif Decimal(goal.target_amount) > 0:
                     remaining = max(Decimal(goal.target_amount) - value, Decimal("0"))
                     lines.append(
                         f"{goal.icon} {goal.name}: {format_money(value)} / "
@@ -645,10 +651,7 @@ def build_router(deps: TelegramDependencies) -> Router:
     async def cycle_callback(callback: CallbackQuery) -> None:
         if callback.message is None or callback.from_user is None or not callback.data:
             return
-        if not await authorize_callback(callback, deps):
-            return
-        if callback.from_user.id != deps.settings.telegram_owner_user_id:
-            await callback.answer("Закрыть месяц может только владелец.", show_alert=True)
+        if not await authorize_callback(callback, deps, owner_only=True):
             return
         parts = callback.data.split(":")
         action = parts[1] if len(parts) >= 2 else ""
@@ -662,6 +665,8 @@ def build_router(deps: TelegramDependencies) -> Router:
             return
         local_now = datetime.now(deps.settings.timezone)
         amount = Decimal("0")
+        border_contribution = Decimal("0")
+        mandatory_reserved = Decimal("0")
         destination_goal: SavingsGoal | None = None
         try:
             async with deps.session_factory() as session, session.begin():
@@ -680,14 +685,17 @@ def build_router(deps: TelegramDependencies) -> Router:
                         show_alert=True,
                     )
                     return
-                if local_now.date() < cycle.end_date:
+                if not cycle_can_close(local_now, cycle, deps.settings):
                     await callback.answer("Ещё рано закрывать этот месяц.", show_alert=True)
                     return
                 pending = await pending_receipt_count(session, cycle.id)
                 if pending:
                     await callback.answer(f"Есть непроведённые чеки: {pending}.", show_alert=True)
                     return
-                amount = await cycle_cash_remainder_kzt(session, cycle.id)
+                breakdown = await cycle_close_breakdown(session, cycle)
+                amount = breakdown.transferable_kzt
+                border_contribution = breakdown.border_contribution_kzt
+                mandatory_reserved = breakdown.mandatory_reserved_kzt
                 if action in {"goal", "rollover"}:
                     destination_goal = await resolve_active_goal_reference(
                         session,
@@ -697,12 +705,32 @@ def build_router(deps: TelegramDependencies) -> Router:
                     if destination_goal is None:
                         await callback.answer("Цель не найдена.", show_alert=True)
                         return
-                    if not amount:
-                        await callback.answer(
-                            "Свободного остатка для переноса нет.",
-                            show_alert=True,
-                        )
+                else:
+                    destination_goal = await resolve_active_goal_reference(
+                        session,
+                        household.id,
+                        "reserve",
+                    )
+                    if destination_goal is None:
+                        await callback.answer("Цель резерва не найдена.", show_alert=True)
                         return
+
+                event_key = f"callback:{callback.id}"
+                if border_contribution:
+                    await post_goal_contribution(
+                        session,
+                        deps.rate_service,
+                        household,
+                        cycle,
+                        "border_run",
+                        border_contribution,
+                        "KZT",
+                        local_now,
+                        callback.from_user.id,
+                        source_event_key=event_key,
+                        source_item_index=0,
+                    )
+                if amount:
                     await post_goal_contribution(
                         session,
                         deps.rate_service,
@@ -713,10 +741,12 @@ def build_router(deps: TelegramDependencies) -> Router:
                         "KZT",
                         local_now,
                         callback.from_user.id,
+                        source_event_key=event_key,
+                        source_item_index=1,
                     )
                 cycle.status = "closed"
                 cycle.closed_at = local_now.astimezone(UTC)
-                destination = destination_goal.key if destination_goal else "reserve"
+                destination = destination_goal.key
                 session.add(
                     AuditLog(
                         household_id=household.id,
@@ -727,8 +757,10 @@ def build_router(deps: TelegramDependencies) -> Router:
                         before_data={"status": "open"},
                         after_data={
                             "status": "closed",
+                            "mandatory_reserved_kzt": str(mandatory_reserved),
+                            "border_contribution_kzt": str(border_contribution),
                             "remainder_kzt": str(amount),
-                            "rollover_kzt": str(amount if destination_goal else Decimal("0")),
+                            "rollover_kzt": str(amount),
                             "destination": destination,
                         },
                     )
@@ -738,15 +770,16 @@ def build_router(deps: TelegramDependencies) -> Router:
             return
         await callback.answer("Месяц закрыт")
         await callback.message.edit_reply_markup(reply_markup=None)
-        if destination_goal is not None:
+        if amount:
             await callback.message.reply(
                 f"✅ {format_money(amount)} ₸ перенесено в «{escape(destination_goal.name)}». "
-                "Месяц закрыт, история сохранена."
+                f"На бордерран отложено {format_money(border_contribution)} ₸. "
+                "Месяц закрыт."
             )
         else:
             await callback.message.reply(
-                f"✅ Месяц закрыт. {format_money(amount)} ₸ "
-                "оставлено свободным резервом."
+                "✅ Месяц закрыт. После обязательств и бордеррана "
+                "свободного остатка нет."
             )
 
     @router.callback_query(F.data.startswith("receipt:"))
@@ -761,8 +794,17 @@ def build_router(deps: TelegramDependencies) -> Router:
             await callback.message.edit_reply_markup(reply_markup=None)
             return
         async with deps.session_factory() as session, session.begin():
+            household = await get_household_by_chat(session, callback.message.chat.id)
+            if household is None:
+                await callback.answer("Семья не найдена", show_alert=True)
+                return
             receipt = await session.scalar(
-                select(Receipt).where(Receipt.id == receipt_id).options(selectinload(Receipt.items))
+                select(Receipt)
+                .where(
+                    Receipt.id == receipt_id,
+                    Receipt.household_id == household.id,
+                )
+                .options(selectinload(Receipt.items))
             )
             if receipt is None:
                 await callback.answer("Чек не найден", show_alert=True)
@@ -781,6 +823,41 @@ def build_router(deps: TelegramDependencies) -> Router:
                 await callback.answer("Чек снова в очереди")
                 await callback.message.edit_reply_markup(reply_markup=None)
                 await callback.message.reply("🔄 Повторно обрабатываю чек…")
+                return
+            if action == "current":
+                if receipt.status == "posted":
+                    await callback.answer("Чек уже проведён", show_alert=True)
+                    return
+                receipt.force_current_cycle = True
+                receipt.status = "retrying"
+                receipt.retry_count = 0
+                receipt.next_attempt_at = datetime.now(UTC)
+                receipt.error_message = None
+                await callback.answer("Учту в текущем месяце")
+                await callback.message.edit_reply_markup(reply_markup=None)
+                await callback.message.reply("🔄 Повторно обрабатываю чек как текущий…")
+                return
+            if action == "dismiss":
+                if receipt.status == "posted":
+                    await callback.answer(
+                        "Проведённый чек нужно удалить кнопкой «Удалить».",
+                        show_alert=True,
+                    )
+                    return
+                receipt.status = "reversed"
+                receipt.error_message = None
+                session.add(
+                    AuditLog(
+                        household_id=receipt.household_id,
+                        actor_user_id=callback.from_user.id,
+                        action="receipt_dismissed",
+                        entity_type="receipt",
+                        entity_id=receipt.id,
+                    )
+                )
+                await callback.answer("Чек не будет учитываться")
+                await callback.message.edit_reply_markup(reply_markup=None)
+                await callback.message.reply("🗑 Чек пропущен и больше не блокирует месяц.")
                 return
             if action == "delete":
                 await session.execute(
@@ -838,6 +915,17 @@ def build_router(deps: TelegramDependencies) -> Router:
 
 def compact_callback_reference(value: str) -> str:
     return value.replace("-", "").casefold()
+
+
+def cycle_can_close(now: datetime, cycle: BudgetCycle, settings: Settings) -> bool:
+    if now.date() > cycle.end_date:
+        return True
+    if now.date() < cycle.end_date:
+        return False
+    return (now.hour, now.minute) >= (
+        settings.daily_report_hour,
+        settings.daily_report_minute,
+    )
 
 
 async def resolve_open_cycle_reference(
@@ -920,19 +1008,28 @@ async def prompt_cycle_close(
                     f"{current_cycle.end_date.strftime('%d.%m.%Y')}."
                 )
             return
+        if not cycle_can_close(local_now, cycle, deps.settings):
+            await message.reply(
+                f"Закрыть месяц можно сегодня после "
+                f"{deps.settings.daily_report_hour:02d}:"
+                f"{deps.settings.daily_report_minute:02d}."
+            )
+            return
         pending = await pending_receipt_count(session, cycle.id)
         if pending:
             await message.reply(
                 f"Сначала разберите {pending} чек(а/ов), которые ещё не проведены."
             )
             return
-        amount = await cycle_cash_remainder_kzt(session, cycle.id)
+        breakdown = await cycle_close_breakdown(session, cycle)
+        amount = breakdown.transferable_kzt
         goals = (
             await session.scalars(
                 select(SavingsGoal)
                 .where(
                     SavingsGoal.household_id == household.id,
                     SavingsGoal.active.is_(True),
+                    SavingsGoal.key != "reserve",
                 )
                 .order_by(SavingsGoal.goal_type, SavingsGoal.name)
             )
@@ -941,10 +1038,10 @@ async def prompt_cycle_close(
     goal_options = [(goal.id, goal.name, goal.icon) for goal in goals]
     if amount:
         text = (
-            f"💰 Фактический свободный остаток: "
-            f"<b>{format_money(amount)} ₸</b>.\n"
-            "Расчёт: все поступления минус расходы и уже сделанные "
-            "переводы в накопления.\n\nКуда переложить весь остаток?"
+            f"💰 Можно отложить: <b>{format_money(amount)} ₸</b>.\n"
+            f"Обязательства: {format_money(breakdown.mandatory_reserved_kzt)} ₸. "
+            f"Бордерран: {format_money(breakdown.border_contribution_kzt)} ₸.\n\n"
+            "Куда переложить остаток?"
         )
     else:
         text = (
@@ -969,8 +1066,20 @@ async def handle_natural_operation(
     text: str,
 ) -> None:
     local_now = datetime.now(deps.settings.timezone)
+    message_chat = getattr(getattr(message, "chat", None), "id", None)
+    message_chat = message_chat or household.telegram_chat_id or 0
+    message_id = getattr(message, "message_id", id(message))
+    source_event_key = f"message:{message_chat}:{message_id}"
     try:
         async with deps.session_factory() as session:
+            already_recorded = await session.scalar(
+                select(LedgerEntry.id)
+                .where(LedgerEntry.source_event_key == source_event_key)
+                .limit(1)
+            )
+            if already_recorded is not None:
+                await message.reply("ℹ️ Это сообщение уже учтено. Повторно ничего не записываю.")
+                return
             category_models = (
                 await session.scalars(
                     select(Category).where(
@@ -1017,6 +1126,7 @@ async def handle_natural_operation(
                 user_id,
                 text,
                 interpretation=interpretation,
+                source_event_key=source_event_key,
             )
             return
         if interpretation.kind == "other":
@@ -1052,9 +1162,14 @@ async def handle_natural_operation(
                 local_now.date(),
                 deps.settings.financial_cycle_start_day,
             )
+            if cycle.status != "open":
+                raise ValueError(
+                    "финансовый месяц уже закрыт; новую операцию можно записать "
+                    "после начала следующего цикла"
+                )
             if interpretation.kind == "expense":
                 posted_expenses: list[tuple[PostedEntry, Category]] = []
-                for item in interpretation.items:
+                for item_index, item in enumerate(interpretation.items):
                     if (
                         item.amount is None
                         or item.currency is None
@@ -1076,6 +1191,8 @@ async def handle_natural_operation(
                         item.description,
                         local_now,
                         user_id,
+                        source_event_key=source_event_key,
+                        source_item_index=item_index,
                     )
                     posted_expenses.append((posted, category))
                 response = await build_expense_response(
@@ -1083,7 +1200,7 @@ async def handle_natural_operation(
                 )
             elif interpretation.kind == "income":
                 lines = ["✅ <b>Доход записан</b>"]
-                for item in interpretation.items:
+                for item_index, item in enumerate(interpretation.items):
                     if item.amount is None or item.currency is None or not item.description:
                         raise ValueError("не хватает описания дохода, суммы или валюты")
                     posted = await post_income(
@@ -1096,6 +1213,8 @@ async def handle_natural_operation(
                         item.description,
                         local_now,
                         user_id,
+                        source_event_key=source_event_key,
+                        source_item_index=item_index,
                     )
                     source = (
                         await session.get(IncomeSource, posted.entry.income_source_id)
@@ -1126,7 +1245,7 @@ async def handle_natural_operation(
                     )
                 )
                 lines = [heading]
-                for item in interpretation.items:
+                for item_index, item in enumerate(interpretation.items):
                     if interpretation.kind == "goal_update":
                         goal = await load_existing_savings_goal(
                             session,
@@ -1222,6 +1341,8 @@ async def handle_natural_operation(
                             currency,
                             local_now,
                             user_id,
+                            source_event_key=source_event_key,
+                            source_item_index=item_index,
                         )
                     else:
                         posted = await post_goal_expense(
@@ -1235,6 +1356,8 @@ async def handle_natural_operation(
                             item.description or f"Расход из цели «{goal.name}»",
                             local_now,
                             user_id,
+                            source_event_key=source_event_key,
+                            source_item_index=item_index,
                         )
                     balance = await goal_balance(session, household.id, goal.id)
                     target = Decimal(goal.target_amount)
@@ -1267,6 +1390,8 @@ async def handle_natural_operation(
         )
     except (CurrencyError, InvalidOperation, ValueError) as exc:
         await message.reply(f"Не удалось провести операцию: {escape(str(exc))}")
+    except IntegrityError:
+        await message.reply("ℹ️ Это сообщение уже учтено. Повторно ничего не записываю.")
     except Exception:
         await message.reply("❌ Нейросеть не смогла разобрать сообщение. Операция не проведена.")
 
@@ -1468,6 +1593,7 @@ async def correct_last_expense(
     user_id: int,
     text: str,
     interpretation: ExpenseInterpretation | None = None,
+    source_event_key: str | None = None,
 ) -> None:
     async with deps.session_factory() as session:
         last_entry = await session.scalar(
@@ -1652,6 +1778,8 @@ async def correct_last_expense(
                     correction.description or locked_entry.description,
                     locked_entry.occurred_at.astimezone(deps.settings.timezone),
                     user_id,
+                    source_event_key=source_event_key,
+                    source_item_index=0,
                 )
                 new_posted.entry.reversal_of_id = locked_entry.id
                 session.add(
@@ -1772,7 +1900,12 @@ async def authorize_message(
         return household, user_id
 
 
-async def authorize_callback(callback: CallbackQuery, deps: TelegramDependencies) -> bool:
+async def authorize_callback(
+    callback: CallbackQuery,
+    deps: TelegramDependencies,
+    *,
+    owner_only: bool = False,
+) -> bool:
     if callback.message is None:
         return False
     async with deps.session_factory() as session:
@@ -1786,7 +1919,12 @@ async def authorize_callback(callback: CallbackQuery, deps: TelegramDependencies
                 Member.active.is_(True),
             )
         )
-        return member is not None
+        if member is None:
+            return False
+        if owner_only and member.role != "owner":
+            await callback.answer("Это действие доступно только владельцу.", show_alert=True)
+            return False
+        return True
 
 
 async def pending_receipt_count(session: AsyncSession, cycle_id: str) -> int:

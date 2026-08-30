@@ -242,3 +242,75 @@ async def test_terminal_failure_is_saved_even_if_telegram_notification_fails() -
         assert saved.retry_count == settings.receipt_retry_limit
         assert saved.error_message == "invalid schema"
     await engine.dispose()
+
+
+async def test_review_receipt_can_be_retried_counted_current_or_dismissed() -> None:
+    engine, factory, settings = await queue_context()
+    async with factory() as session, session.begin():
+        household = await seed_default_household(session, settings)
+        assert household is not None
+        cycle = await get_current_cycle(session, household, date(2026, 8, 29), 5)
+        receipt = Receipt(
+            household_id=household.id,
+            cycle_id=cycle.id,
+            telegram_chat_id=-100123,
+            telegram_message_id=40,
+            created_by_user_id=42,
+            status="analyzing",
+        )
+        session.add(receipt)
+        await session.flush()
+        receipt_id = receipt.id
+
+    bot = AsyncMock()
+    worker = ReceiptWorker(settings, factory, bot, object(), object())  # type: ignore[arg-type]
+    await worker._mark_review(
+        receipt_id,
+        "старый финансовый месяц",
+        allow_current_cycle=True,
+    )
+
+    keyboard = bot.send_message.await_args.kwargs["reply_markup"]
+    callbacks = [
+        button.callback_data
+        for row in keyboard.inline_keyboard
+        for button in row
+    ]
+    assert callbacks == [
+        f"receipt:current:{receipt_id}",
+        f"receipt:retry:{receipt_id}",
+        f"receipt:dismiss:{receipt_id}",
+    ]
+    await engine.dispose()
+
+
+async def test_posted_receipt_confirmation_is_retried_after_telegram_failure() -> None:
+    engine, factory, settings = await queue_context()
+    async with factory() as session, session.begin():
+        household = await seed_default_household(session, settings)
+        assert household is not None
+        cycle = await get_current_cycle(session, household, date(2026, 8, 29), 5)
+        receipt = Receipt(
+            household_id=household.id,
+            cycle_id=cycle.id,
+            telegram_chat_id=-100123,
+            telegram_message_id=41,
+            created_by_user_id=42,
+            status="posted",
+            confirmation_status="pending",
+        )
+        session.add(receipt)
+        await session.flush()
+        receipt_id = receipt.id
+
+    worker = ReceiptWorker(settings, factory, AsyncMock(), object(), object())  # type: ignore[arg-type]
+    assert await worker._claim_confirmation() == receipt_id
+    await worker._schedule_confirmation_retry(receipt_id, "Telegram unavailable")
+
+    async with factory() as session:
+        saved = await session.get(Receipt, receipt_id)
+        assert saved is not None
+        assert saved.confirmation_status == "retrying"
+        assert saved.confirmation_retry_count == 1
+        assert saved.error_message == "Telegram unavailable"
+    await engine.dispose()

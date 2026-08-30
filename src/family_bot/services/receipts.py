@@ -33,6 +33,7 @@ from family_bot.models import (
     Subcategory,
     utcnow,
 )
+from family_bot.services.cycles import get_current_cycle
 from family_bot.services.ledger import allocation_and_spend, post_expense
 from family_bot.services.money import normalize_currency, quantize
 from family_bot.services.rates import RateService, RateUnavailableError
@@ -52,6 +53,10 @@ MAX_RECEIPT_FUTURE_SKEW = timedelta(days=1)
 
 
 class ReceiptValidationError(ValueError):
+    pass
+
+
+class ClosedCycleReceiptError(ReceiptValidationError):
     pass
 
 
@@ -140,6 +145,10 @@ class ReceiptService:
                 existing_receipt.extraction = None
                 existing_receipt.overall_confidence = None
                 existing_receipt.posted_at = None
+                existing_receipt.confirmation_status = "pending"
+                existing_receipt.confirmation_retry_count = 0
+                existing_receipt.confirmation_next_attempt_at = utcnow()
+                existing_receipt.confirmation_sent_at = None
                 existing_image.telegram_file_id = file_id
                 existing_image.mime_type = mime_type
                 return ReceiptEnqueueResult(existing_receipt, "requeued")
@@ -214,6 +223,17 @@ class ReceiptWorker:
                 if not recovered:
                     await self._recover_inflight()
                     recovered = True
+                confirmation_id = await self._claim_confirmation()
+                if confirmation_id is not None:
+                    try:
+                        await self._send_confirmation(confirmation_id)
+                    except Exception as exc:
+                        logger.exception(
+                            "Receipt %s Telegram confirmation failed; it will retry",
+                            confirmation_id,
+                        )
+                        await self._schedule_confirmation_retry(confirmation_id, str(exc))
+                    continue
                 receipt_id = await self._claim_next()
                 if receipt_id is not None:
                     await self._process(receipt_id)
@@ -240,6 +260,32 @@ class ReceiptWorker:
                 .where(Receipt.status == "analyzing")
                 .values(status="retrying", next_attempt_at=utcnow())
             )
+            await session.execute(
+                update(Receipt)
+                .where(Receipt.confirmation_status == "sending")
+                .values(
+                    confirmation_status="retrying",
+                    confirmation_next_attempt_at=utcnow(),
+                )
+            )
+
+    async def _claim_confirmation(self) -> str | None:
+        async with self.session_factory() as session, session.begin():
+            receipt = await session.scalar(
+                select(Receipt)
+                .where(
+                    Receipt.status == "posted",
+                    Receipt.confirmation_status.in_(("pending", "retrying")),
+                    Receipt.confirmation_next_attempt_at <= utcnow(),
+                )
+                .order_by(Receipt.posted_at, Receipt.created_at)
+                .limit(1)
+                .with_for_update(skip_locked=True)
+            )
+            if receipt is None:
+                return None
+            receipt.confirmation_status = "sending"
+            return receipt.id
 
     async def _claim_next(self) -> str | None:
         async with self.session_factory() as session, session.begin():
@@ -288,6 +334,12 @@ class ReceiptWorker:
                     subcategory_models,
                 )
                 await session.commit()
+        except ClosedCycleReceiptError as exc:
+            await self._mark_review(
+                receipt_id,
+                str(exc),
+                allow_current_cycle=True,
+            )
         except ReceiptValidationError as exc:
             await self._mark_review(receipt_id, str(exc))
         except RateUnavailableError as exc:
@@ -303,13 +355,6 @@ class ReceiptWorker:
         except Exception as exc:
             logger.exception("Receipt %s processing failed", receipt_id)
             await self._mark_failed(receipt_id, str(exc))
-        else:
-            try:
-                await self._send_confirmation(receipt_id)
-            except Exception:
-                logger.exception(
-                    "Receipt %s was posted but its Telegram confirmation failed", receipt_id
-                )
 
     async def _download_images(
         self, session: AsyncSession, receipt: Receipt
@@ -429,6 +474,27 @@ class ReceiptWorker:
         if household is None:
             raise RuntimeError("Household disappeared during receipt processing")
 
+        if receipt.force_current_cycle:
+            target_cycle = await session.get_one(BudgetCycle, receipt.cycle_id)
+        else:
+            target_cycle = await get_current_cycle(
+                session,
+                household,
+                purchased_at.date(),
+                self.settings.financial_cycle_start_day,
+            )
+            receipt.cycle_id = target_cycle.id
+        if target_cycle.status != "open":
+            if receipt.force_current_cycle:
+                raise ReceiptValidationError(
+                    "Текущий финансовый месяц уже закрыт. Чек можно не учитывать "
+                    "или записать расход после начала нового месяца."
+                )
+            raise ClosedCycleReceiptError(
+                "Дата покупки относится к уже закрытому финансовому месяцу. "
+                "Можно учесть чек в текущем месяце или не учитывать его."
+            )
+
         grouped: dict[str, Decimal] = defaultdict(lambda: Decimal("0"))
         source_rate = await self.rate_service.get_quote(session, currency, purchased_at.date())
         await session.execute(delete(ReceiptItem).where(ReceiptItem.receipt_id == receipt.id))
@@ -466,7 +532,7 @@ class ReceiptWorker:
                 session=session,
                 rate_service=self.rate_service,
                 household=household,
-                cycle=await session.get_one(BudgetCycle, receipt.cycle_id),
+                cycle=target_cycle,
                 category=categories[category_key],
                 amount=amount,
                 currency=currency,
@@ -494,6 +560,10 @@ class ReceiptWorker:
         receipt.extraction = stored_extraction.model_dump(mode="json")
         receipt.overall_confidence = Decimal(str(extraction.overall_confidence))
         receipt.posted_at = utcnow()
+        receipt.confirmation_status = "pending"
+        receipt.confirmation_retry_count = 0
+        receipt.confirmation_next_attempt_at = utcnow()
+        receipt.confirmation_sent_at = None
         receipt.error_message = None
 
     async def _send_confirmation(self, receipt_id: str) -> None:
@@ -585,9 +655,30 @@ class ReceiptWorker:
                 reply_to_message_id=receipt.telegram_message_id,
                 reply_markup=keyboard,
             )
+            receipt.confirmation_status = "sent"
+            receipt.confirmation_sent_at = utcnow()
+            receipt.confirmation_retry_count = 0
+            receipt.error_message = None
+            await session.commit()
+
+    async def _schedule_confirmation_retry(self, receipt_id: str, message: str) -> None:
+        async with self.session_factory() as session, session.begin():
+            receipt = await session.get(Receipt, receipt_id)
+            if receipt is None or receipt.confirmation_status == "sent":
+                return
+            receipt.confirmation_retry_count += 1
+            delay = min(300, 2 ** min(receipt.confirmation_retry_count, 6) * 5)
+            receipt.confirmation_status = "retrying"
+            receipt.confirmation_next_attempt_at = utcnow() + timedelta(seconds=delay)
+            receipt.error_message = (message or receipt.error_message or "")[:2000]
 
     async def _mark_review(
-        self, receipt_id: str, message: str, status: str = "needs_review"
+        self,
+        receipt_id: str,
+        message: str,
+        status: str = "needs_review",
+        *,
+        allow_current_cycle: bool = False,
     ) -> None:
         async with self.session_factory() as session, session.begin():
             receipt = await session.get(Receipt, receipt_id)
@@ -598,10 +689,32 @@ class ReceiptWorker:
             chat_id = receipt.telegram_chat_id
             message_id = receipt.telegram_message_id
         try:
+            buttons = [
+                InlineKeyboardButton(
+                    text="🔄 Повторить",
+                    callback_data=f"receipt:retry:{receipt_id}",
+                ),
+                InlineKeyboardButton(
+                    text="🗑 Не учитывать",
+                    callback_data=f"receipt:dismiss:{receipt_id}",
+                ),
+            ]
+            rows = [buttons]
+            if allow_current_cycle:
+                rows.insert(
+                    0,
+                    [
+                        InlineKeyboardButton(
+                            text="📅 Учесть в текущем месяце",
+                            callback_data=f"receipt:current:{receipt_id}",
+                        )
+                    ],
+                )
             await self.bot.send_message(
                 chat_id,
                 f"⚠️ Чек пока не проведён: {escape(message)}",
                 reply_to_message_id=message_id,
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             )
         except Exception:
             logger.exception("Could not notify Telegram about receipt %s review", receipt_id)
@@ -635,7 +748,11 @@ class ReceiptWorker:
                         InlineKeyboardButton(
                             text="🔄 Повторить",
                             callback_data=f"receipt:retry:{receipt_id}",
-                        )
+                        ),
+                        InlineKeyboardButton(
+                            text="🗑 Не учитывать",
+                            callback_data=f"receipt:dismiss:{receipt_id}",
+                        ),
                     ]
                 ]
             )

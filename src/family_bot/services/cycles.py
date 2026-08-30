@@ -266,6 +266,15 @@ async def seed_household(
             BORDER_RUN_MONTHLY_KZT,
             6,
         ),
+        (
+            "reserve",
+            "Свободный резерв",
+            "🧰",
+            "reserve",
+            Decimal("0"),
+            Decimal("0"),
+            None,
+        ),
     )
     for key, name, icon, goal_type, target, monthly, recurrence in goal_specs:
         goal = await session.scalar(

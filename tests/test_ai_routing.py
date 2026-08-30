@@ -16,8 +16,10 @@ from family_bot.telegram.handlers import handle_natural_operation
 
 
 class FakeMessage:
-    def __init__(self) -> None:
+    def __init__(self, message_id: int = 1) -> None:
         self.replies: list[str] = []
+        self.chat = SimpleNamespace(id=-100777)
+        self.message_id = message_id
 
     async def reply(self, text: str, **kwargs: object) -> None:
         self.replies.append(text)
@@ -111,6 +113,43 @@ async def test_non_financial_text_is_not_posted() -> None:
     assert message.replies and "Ничего не записал" in message.replies[0]
     async with factory() as session:
         assert await session.scalar(select(func.count(LedgerEntry.id))) == 0
+    await engine.dispose()
+
+
+async def test_same_telegram_message_never_posts_twice() -> None:
+    engine, factory, household, settings = await make_budget()
+    interpreter = FakeInterpreter(
+        ExpenseInterpretation(
+            kind="income",
+            items=[
+                InterpretedExpenseItem(
+                    description="зарплата",
+                    amount=840000,
+                    currency="KZT",
+                    confidence=0.99,
+                )
+            ],
+            overall_confidence=0.99,
+        )
+    )
+    deps = SimpleNamespace(
+        settings=settings,
+        session_factory=factory,
+        rate_service=RateService(),
+        expense_interpreter=interpreter,
+    )
+    message = FakeMessage(message_id=77)
+
+    await handle_natural_operation(message, deps, household, 42, "зарплата 840000 тенге")
+    await handle_natural_operation(message, deps, household, 42, "зарплата 840000 тенге")
+
+    async with factory() as session:
+        count = await session.scalar(
+            select(func.count(LedgerEntry.id)).where(LedgerEntry.entry_type == "income")
+        )
+    assert count == 1
+    assert len(interpreter.calls) == 1
+    assert "уже учтено" in message.replies[-1]
     await engine.dispose()
 
 

@@ -188,7 +188,16 @@ class Receipt(Base, TimestampMixin):
     error_message: Mapped[str | None] = mapped_column(Text, nullable=True)
     retry_count: Mapped[int] = mapped_column(Integer, default=0)
     next_attempt_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    force_current_cycle: Mapped[bool] = mapped_column(Boolean, default=False)
     posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    confirmation_status: Mapped[str] = mapped_column(String(20), default="pending")
+    confirmation_retry_count: Mapped[int] = mapped_column(Integer, default=0)
+    confirmation_next_attempt_at: Mapped[datetime] = mapped_column(
+        DateTime(timezone=True), default=utcnow
+    )
+    confirmation_sent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
 
     images: Mapped[list[ReceiptImage]] = relationship(
         back_populates="receipt", cascade="all, delete-orphan"
@@ -272,7 +281,14 @@ class ExchangeRate(Base, TimestampMixin):
 
 class LedgerEntry(Base, TimestampMixin):
     __tablename__ = "ledger_entries"
-    __table_args__ = (Index("ix_ledger_cycle_type", "cycle_id", "entry_type"),)
+    __table_args__ = (
+        Index("ix_ledger_cycle_type", "cycle_id", "entry_type"),
+        UniqueConstraint(
+            "source_event_key",
+            "source_item_index",
+            name="uq_ledger_source_event_item",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     household_id: Mapped[str] = mapped_column(ForeignKey("households.id", ondelete="CASCADE"))
@@ -301,6 +317,8 @@ class LedgerEntry(Base, TimestampMixin):
     )
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     created_by_user_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
+    source_event_key: Mapped[str | None] = mapped_column(String(200), nullable=True)
+    source_item_index: Mapped[int | None] = mapped_column(Integer, nullable=True)
     status: Mapped[str] = mapped_column(String(20), default="posted")
     reversal_of_id: Mapped[str | None] = mapped_column(
         ForeignKey("ledger_entries.id", ondelete="SET NULL"), nullable=True

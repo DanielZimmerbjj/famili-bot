@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from family_bot.config import Settings
 from family_bot.models import BudgetCycle, Household, SavingsGoal, ScheduledRun, utcnow
 from family_bot.services.cycles import get_current_cycle
-from family_bot.services.ledger import cycle_cash_remainder_kzt
+from family_bot.services.ledger import cycle_close_breakdown
 from family_bot.services.rates import RateService
 from family_bot.services.reports import build_report
 from family_bot.telegram.keyboards import cycle_close_keyboard, main_menu_keyboard
@@ -112,13 +112,15 @@ class ReportScheduler:
                 .order_by(BudgetCycle.end_date)
             )
             if cycle_to_close is not None:
-                amount = await cycle_cash_remainder_kzt(session, cycle_to_close.id)
+                breakdown = await cycle_close_breakdown(session, cycle_to_close)
+                amount = breakdown.transferable_kzt
                 goals = (
                     await session.scalars(
                         select(SavingsGoal)
                         .where(
                             SavingsGoal.household_id == household.id,
                             SavingsGoal.active.is_(True),
+                            SavingsGoal.key != "reserve",
                         )
                         .order_by(SavingsGoal.goal_type, SavingsGoal.name)
                     )
@@ -128,7 +130,7 @@ class ReportScheduler:
                     household.telegram_chat_id,
                     (
                         "Финансовый месяц завершён. "
-                        "Свободный остаток: "
+                        "После обязательств и бордеррана можно отложить: "
                         f"<b>{f'{amount:,.0f}'.replace(',', ' ')} ₸</b>. "
                         "Куда его направить?"
                         if amount
