@@ -4,14 +4,17 @@ from zoneinfo import ZoneInfo
 
 import pytest
 
+from family_bot.models import ReceiptItem
 from family_bot.services.receipt_ai import ExtractedItem
 from family_bot.services.receipts import (
     ReceiptValidationError,
     allocate_receipt_total,
+    extraction_decimal,
     is_seven_eleven_merchant,
     normalize_purchased_at,
     prepare_chargeable_items,
     prepare_receipt_items,
+    receipt_adjustment_lines,
 )
 
 
@@ -143,7 +146,51 @@ def test_exact_124_baht_seven_eleven_receipt_posts_seven_paid_rows() -> None:
     assert len(prepared) == 7
     assert uncertain == []
     assert sum(allocations) == Decimal("124.00000000")
+    assert [prepared_item.line_total for prepared_item in prepared] == [
+        Decimal("15"),
+        Decimal("35"),
+        Decimal("15"),
+        Decimal("15"),
+        Decimal("24"),
+        Decimal("24"),
+        Decimal("10"),
+    ]
+    assert allocations != [prepared_item.line_total for prepared_item in prepared]
     assert {prepared_item.category_key for prepared_item in prepared} == {"seven_eleven"}
+
+
+def test_reads_receipt_adjustments_from_persisted_extraction_safely() -> None:
+    extraction = {"discount": "14.00", "tax": "0", "broken": "not-a-number"}
+
+    assert extraction_decimal(extraction, "discount") == Decimal("14.00")
+    assert extraction_decimal(extraction, "tax") == Decimal("0")
+    assert extraction_decimal(extraction, "broken") == Decimal("0")
+    assert extraction_decimal(None, "discount") == Decimal("0")
+
+
+def test_exact_receipt_shows_printed_subtotal_and_discount_separately() -> None:
+    printed_prices = ("15", "35", "15", "15", "24", "24", "10")
+    allocated_prices = ("13.48", "31.45", "13.48", "13.48", "21.57", "21.57", "8.99")
+    stored_items = [
+        ReceiptItem(
+            raw_name=f"item {index}",
+            printed_line_total=Decimal(printed),
+            line_total=Decimal(allocated),
+        )
+        for index, (printed, allocated) in enumerate(
+            zip(printed_prices, allocated_prices, strict=True), 1
+        )
+    ]
+
+    assert receipt_adjustment_lines(
+        stored_items,
+        Decimal("124"),
+        "THB",
+        {"discount": "14", "tax": "0"},
+    ) == [
+        "Сумма товаров: <b>138 THB</b>",
+        "Скидка по чеку: <b>−14 THB</b>",
+    ]
 
 
 @pytest.mark.parametrize(

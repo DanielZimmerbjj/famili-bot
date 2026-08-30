@@ -232,6 +232,7 @@ class ReceiptItem(Base, TimestampMixin):
     display_name_ru: Mapped[str | None] = mapped_column(String(500), nullable=True)
     quantity: Mapped[Decimal] = mapped_column(Money, default=Decimal("1"))
     unit_price: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
+    printed_line_total: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
     line_total: Mapped[Decimal] = mapped_column(Money)
     amount_kzt: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
     envelope_amount: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
@@ -244,6 +245,15 @@ class ReceiptItem(Base, TimestampMixin):
     def display_name(self) -> str:
         """Russian user-facing name, with a fallback for receipts created before v1.1."""
         return self.display_name_ru or self.raw_name
+
+    @property
+    def display_line_total(self) -> Decimal:
+        """Price printed on the receipt, falling back to the allocated legacy value."""
+        return (
+            self.printed_line_total
+            if self.printed_line_total is not None
+            else self.line_total
+        )
 
 
 class ExchangeRate(Base, TimestampMixin):

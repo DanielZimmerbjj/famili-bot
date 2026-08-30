@@ -451,6 +451,7 @@ class ReceiptWorker:
                     display_name_ru=item.name_ru[:500],
                     quantity=quantize(item.quantity),
                     unit_price=quantize(item.unit_price) if item.unit_price is not None else None,
+                    printed_line_total=quantize(item.line_total),
                     line_total=allocated_total,
                     amount_kzt=amount_kzt,
                     envelope_amount=envelope_amount,
@@ -531,10 +532,19 @@ class ReceiptWorker:
             sorted_items = sorted(receipt.items, key=lambda item: item.created_at)
             for index, item in enumerate(sorted_items, 1):
                 lines.append(
-                    f"{index}. {escape(item.display_name)} — {format_money(item.line_total)} "
+                    f"{index}. {escape(item.display_name)} — "
+                    f"{format_money(item.display_line_total)} "
                     f"{receipt.original_currency} → "
                     f"{names.get(item.category_id, 'Категория')}"
                 )
+            lines.extend(
+                receipt_adjustment_lines(
+                    sorted_items,
+                    receipt.original_total,
+                    receipt.original_currency,
+                    receipt.extraction,
+                )
+            )
             if receipt.exchange_rate_id:
                 rate = await session.get(ExchangeRate, receipt.exchange_rate_id)
                 if rate is not None:
@@ -647,6 +657,41 @@ def format_money(value: Decimal | None) -> str:
     if decimal == decimal.to_integral():
         return f"{decimal:,.0f}".replace(",", " ")
     return f"{decimal:,.2f}".replace(",", " ")
+
+
+def extraction_decimal(extraction: dict | None, key: str) -> Decimal:
+    """Read a non-negative receipt amount from persisted extraction data safely."""
+    if not extraction:
+        return Decimal("0")
+    try:
+        value = Decimal(str(extraction.get(key, "0")))
+    except (ArithmeticError, ValueError):
+        return Decimal("0")
+    return value if value >= 0 else Decimal("0")
+
+
+def receipt_adjustment_lines(
+    items: list[ReceiptItem],
+    original_total: Decimal,
+    currency: str,
+    extraction: dict | None,
+) -> list[str]:
+    """Explain why printed item prices differ from the paid receipt total."""
+    printed_total = sum(
+        (Decimal(item.display_line_total) for item in items), Decimal("0")
+    )
+    discount = extraction_decimal(extraction, "discount")
+    tax = extraction_decimal(extraction, "tax")
+    lines: list[str] = []
+    if discount > 0 or tax > 0 or printed_total != original_total:
+        lines.append(
+            f"Сумма товаров: <b>{format_money(printed_total)} {currency}</b>"
+        )
+    if discount > 0:
+        lines.append(f"Скидка по чеку: <b>−{format_money(discount)} {currency}</b>")
+    if tax > 0:
+        lines.append(f"Налог: <b>+{format_money(tax)} {currency}</b>")
+    return lines
 
 
 def prepare_chargeable_items(

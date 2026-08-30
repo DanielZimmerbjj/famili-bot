@@ -117,3 +117,16 @@ def test_receipt_item_uses_russian_name_and_keeps_legacy_fallback() -> None:
     assert translated.display_name == "Кофе Nestle Latte"
     assert translated.raw_name == "เนสท์เล่ ลาเต้"
     assert legacy.display_name == "Milk"
+
+
+def test_receipt_item_displays_printed_price_not_allocated_discount_share() -> None:
+    discounted = ReceiptItem(
+        raw_name="สินค้า",
+        printed_line_total=Decimal("15"),
+        line_total=Decimal("13.47826087"),
+    )
+    legacy = ReceiptItem(raw_name="Milk", line_total=Decimal("35"))
+
+    assert discounted.display_line_total == Decimal("15")
+    assert discounted.line_total == Decimal("13.47826087")
+    assert legacy.display_line_total == Decimal("35")
