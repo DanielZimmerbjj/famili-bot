@@ -3,7 +3,11 @@ from decimal import Decimal
 import pytest
 
 from family_bot.services.receipt_ai import ExtractedItem
-from family_bot.services.receipts import ReceiptValidationError, allocate_receipt_total
+from family_bot.services.receipts import (
+    ReceiptValidationError,
+    allocate_receipt_total,
+    prepare_chargeable_items,
+)
 
 
 def item(name: str, total: str) -> ExtractedItem:
@@ -47,6 +51,38 @@ def test_zero_value_promo_line_does_not_change_allocation() -> None:
         tax=Decimal("0"),
     )
     assert allocations == [Decimal("100.00000000"), Decimal("0E-8")]
+
+
+def test_unknown_paid_item_falls_back_to_buffer_without_blocking_receipt() -> None:
+    unknown = ExtractedItem(
+        raw_name="เนสท์เล่ ลาเต้",
+        quantity=Decimal("1"),
+        unit_price=Decimal("35"),
+        line_total=Decimal("35"),
+        category_key="unknown",
+        subcategory_key=None,
+        confidence=0.62,
+    )
+    freebie = ExtractedItem(
+        raw_name="ของแถม",
+        quantity=Decimal("1"),
+        unit_price=Decimal("0"),
+        line_total=Decimal("0"),
+        category_key="unknown",
+        subcategory_key=None,
+        confidence=0.4,
+    )
+
+    prepared, uncertain = prepare_chargeable_items(
+        [unknown, freebie],
+        categories={"buffer": object()},  # type: ignore[dict-item]
+        subcategories={},
+        confidence_threshold=0.75,
+    )
+
+    assert len(prepared) == 1
+    assert prepared[0].category_key == "buffer"
+    assert uncertain == ["เนสท์เล่ ลาเต้"]
 
 
 def test_rejects_unreconciled_total() -> None:

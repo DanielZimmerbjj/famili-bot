@@ -42,6 +42,8 @@ from family_bot.services.receipt_ai import (
 
 logger = logging.getLogger(__name__)
 
+REVIEW_WARNING_PREFIX = "budget_review:"
+
 
 class ReceiptValidationError(ValueError):
     pass
@@ -326,22 +328,15 @@ class ReceiptWorker:
             raise ReceiptValidationError("Не удалось прочитать положительный итог чека")
         if not extraction.items:
             raise ReceiptValidationError("Не удалось прочитать позиции чека")
-        # Keep zero-value promo/freebie rows valid at the AI boundary, but do not
-        # classify or post them as expenses. At least one paid row is required
-        # because the receipt total itself must be positive.
-        items = [item for item in extraction.items if item.line_total > 0]
-        if not items:
-            raise ReceiptValidationError("В чеке не найдено оплаченных позиций")
         currency = normalize_currency(extraction.currency)
-        weak_items = [
-            item
-            for item in items
-            if item.category_key not in categories
-            or item.confidence < self.settings.receipt_review_confidence
-        ]
-        if weak_items or extraction.overall_confidence < self.settings.receipt_review_confidence:
-            names = ", ".join(item.raw_name for item in weak_items[:5])
-            raise ReceiptValidationError(f"Нужно уточнить категории/текст: {names or 'весь чек'}")
+        items, uncertain_names = prepare_chargeable_items(
+            extraction.items,
+            categories,
+            subcategories,
+            self.settings.receipt_review_confidence,
+        )
+        if extraction.overall_confidence < self.settings.receipt_review_confidence:
+            uncertain_names = list(dict.fromkeys([*uncertain_names, "весь чек"]))
 
         allocated_totals = allocate_receipt_total(
             items,
@@ -366,10 +361,6 @@ class ReceiptWorker:
             subcategory = None
             if item.subcategory_key:
                 subcategory = subcategories.get(f"{item.category_key}:{item.subcategory_key}")
-                if subcategory is None:
-                    raise ReceiptValidationError(
-                        f"Недопустимая подкатегория {item.subcategory_key} для {item.raw_name}"
-                    )
             amount_kzt = source_rate.to_kzt(allocated_total)
             envelope_rate = await self.rate_service.get_quote(
                 session, category.envelope_currency, purchased_at.date()
@@ -416,7 +407,13 @@ class ReceiptWorker:
         receipt.exchange_rate_id = source_rate.rate_id
         receipt.model_name = model_name
         receipt.schema_version = self.extractor.schema_version
-        receipt.extraction = extraction.model_dump(mode="json")
+        stored_warnings = list(extraction.warnings)
+        if uncertain_names:
+            stored_warnings.append(REVIEW_WARNING_PREFIX + ", ".join(uncertain_names[:5]))
+        stored_extraction = extraction.model_copy(
+            update={"items": items, "warnings": stored_warnings}
+        )
+        receipt.extraction = stored_extraction.model_dump(mode="json")
         receipt.overall_confidence = Decimal(str(extraction.overall_confidence))
         receipt.posted_at = utcnow()
         receipt.error_message = None
@@ -437,6 +434,23 @@ class ReceiptWorker:
                 f"✅ <b>{escape(receipt.merchant or 'Чек')}</b> · "
                 f"{format_money(receipt.original_total)} {receipt.original_currency}"
             ]
+            extraction_warnings = (
+                receipt.extraction.get("warnings", []) if receipt.extraction else []
+            )
+            review_warning = next(
+                (
+                    str(warning)[len(REVIEW_WARNING_PREFIX) :]
+                    for warning in extraction_warnings
+                    if str(warning).startswith(REVIEW_WARNING_PREFIX)
+                ),
+                None,
+            )
+            if review_warning:
+                lines.append(
+                    "⚠️ Проверьте сомнительные позиции: "
+                    f"<b>{escape(review_warning)}</b>. "
+                    "Неизвестные категории временно отнесены в резерв."
+                )
             sorted_items = sorted(receipt.items, key=lambda item: item.created_at)
             for index, item in enumerate(sorted_items, 1):
                 lines.append(
@@ -462,10 +476,7 @@ class ReceiptWorker:
                     f"{category.icon} {category.name}: осталось "
                     f"<b>{format_money(limit - spent)} {category.envelope_currency}</b>"
                 )
-            lines.append(
-                "Неверно? Ответьте текстом или голосом: "
-                "<i>«нет, позиция 1 — молоко»</i>."
-            )
+            lines.append("Неверно? Ответьте текстом или голосом: <i>«нет, позиция 1 — молоко»</i>.")
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
@@ -544,8 +555,7 @@ class ReceiptWorker:
             try:
                 await self.bot.send_message(
                     chat_id,
-                    "❌ Не удалось обработать чек. "
-                    "Он сохранён и не списан. Бот продолжает работу.",
+                    "❌ Не удалось обработать чек. Он сохранён и не списан. Бот продолжает работу.",
                     reply_to_message_id=message_id,
                     reply_markup=keyboard,
                 )
@@ -560,6 +570,45 @@ def format_money(value: Decimal | None) -> str:
     if decimal == decimal.to_integral():
         return f"{decimal:,.0f}".replace(",", " ")
     return f"{decimal:,.2f}".replace(",", " ")
+
+
+def prepare_chargeable_items(
+    items: list[ExtractedItem],
+    categories: dict[str, Category],
+    subcategories: dict[str, Subcategory],
+    confidence_threshold: float,
+) -> tuple[list[ExtractedItem], list[str]]:
+    """Make every paid row postable while retaining uncertainty for the user."""
+    prepared: list[ExtractedItem] = []
+    uncertain_names: list[str] = []
+    fallback_key = "buffer"
+
+    for source_item in items:
+        # A freebie or fully discounted row is useful extraction context, but it
+        # must not create a zero-value expense or block the rest of the receipt.
+        if source_item.line_total <= 0:
+            continue
+
+        item = source_item
+        uncertain = item.confidence < confidence_threshold
+        if item.category_key not in categories:
+            if fallback_key not in categories:
+                raise ReceiptValidationError(f"Неизвестная категория для позиции {item.raw_name}")
+            item = item.model_copy(update={"category_key": fallback_key, "subcategory_key": None})
+            uncertain = True
+        elif item.subcategory_key and (
+            f"{item.category_key}:{item.subcategory_key}" not in subcategories
+        ):
+            item = item.model_copy(update={"subcategory_key": None})
+            uncertain = True
+
+        prepared.append(item)
+        if uncertain:
+            uncertain_names.append(item.raw_name)
+
+    if not prepared:
+        raise ReceiptValidationError("В чеке не найдено оплаченных позиций")
+    return prepared, list(dict.fromkeys(uncertain_names))
 
 
 def allocate_receipt_total(
