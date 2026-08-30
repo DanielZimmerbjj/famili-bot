@@ -15,9 +15,10 @@ from family_bot.services.receipts import (
 )
 
 
-def item(name: str, total: str) -> ExtractedItem:
+def item(name: str, total: str, name_ru: str | None = None) -> ExtractedItem:
     return ExtractedItem(
         raw_name=name,
+        name_ru=name_ru or name,
         quantity=Decimal("1"),
         unit_price=Decimal(total),
         line_total=Decimal(total),
@@ -61,6 +62,7 @@ def test_zero_value_promo_line_does_not_change_allocation() -> None:
 def test_unknown_paid_item_falls_back_to_buffer_without_blocking_receipt() -> None:
     unknown = ExtractedItem(
         raw_name="เนสท์เล่ ลาเต้",
+        name_ru="Кофе Nestle Latte",
         quantity=Decimal("1"),
         unit_price=Decimal("35"),
         line_total=Decimal("35"),
@@ -70,6 +72,7 @@ def test_unknown_paid_item_falls_back_to_buffer_without_blocking_receipt() -> No
     )
     freebie = ExtractedItem(
         raw_name="ของแถม",
+        name_ru="Подарок по акции",
         quantity=Decimal("1"),
         unit_price=Decimal("0"),
         line_total=Decimal("0"),
@@ -87,7 +90,7 @@ def test_unknown_paid_item_falls_back_to_buffer_without_blocking_receipt() -> No
 
     assert len(prepared) == 1
     assert prepared[0].category_key == "buffer"
-    assert uncertain == ["เนสท์เล่ ลาเต้"]
+    assert uncertain == ["Кофе Nestle Latte"]
 
 
 def test_seven_eleven_receipt_uses_only_dedicated_category() -> None:
@@ -113,14 +116,14 @@ def test_seven_eleven_receipt_uses_only_dedicated_category() -> None:
 
 def test_exact_124_baht_seven_eleven_receipt_posts_seven_paid_rows() -> None:
     source_items = [
-        item("เนสท์เล่ ลาเต้", "15"),
-        item("แซนวิชครีมซองเห็ด", "35"),
-        item("Hกระเทียมปรุงรส", "15"),
-        item("หมากฝรั่ง", "15"),
-        item("เดลฟี่คุกกี้ช็อกโกแลต", "24"),
-        item("เดลฟี่คุกกี้ช็อกโกแลต", "24"),
-        item("H.เกลือ", "10"),
-        item("แสตมป์ 1 บาท", "0"),
+        item("เนสท์เล่ ลาเต้", "15", "Кофе Nestle Latte"),
+        item("แซนวิชครีมซองเห็ด", "35", "Сэндвич с грибным кремом"),
+        item("Hกระเทียมปรุงรส", "15", "Снек со вкусом чеснока"),
+        item("หมากฝรั่ง", "15", "Жевательная резинка"),
+        item("เดลฟี่คุกกี้ช็อกโกแลต", "24", "Шоколадное печенье Delphi"),
+        item("เดลฟี่คุกกี้ช็อกโกแลต", "24", "Шоколадное печенье Delphi"),
+        item("H.เกลือ", "10", "Соль"),
+        item("แสตมป์ 1 บาท", "0", "Акционная марка 1 бат"),
     ]
 
     prepared, uncertain = prepare_receipt_items(

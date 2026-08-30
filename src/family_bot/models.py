@@ -229,6 +229,7 @@ class ReceiptItem(Base, TimestampMixin):
         ForeignKey("subcategories.id", ondelete="SET NULL"), nullable=True
     )
     raw_name: Mapped[str] = mapped_column(String(500))
+    display_name_ru: Mapped[str | None] = mapped_column(String(500), nullable=True)
     quantity: Mapped[Decimal] = mapped_column(Money, default=Decimal("1"))
     unit_price: Mapped[Decimal | None] = mapped_column(Money, nullable=True)
     line_total: Mapped[Decimal] = mapped_column(Money)
@@ -238,6 +239,11 @@ class ReceiptItem(Base, TimestampMixin):
     confidence: Mapped[Decimal] = mapped_column(Numeric(6, 5), default=Decimal("0"))
 
     receipt: Mapped[Receipt] = relationship(back_populates="items")
+
+    @property
+    def display_name(self) -> str:
+        """Russian user-facing name, with a fallback for receipts created before v1.1."""
+        return self.display_name_ru or self.raw_name
 
 
 class ExchangeRate(Base, TimestampMixin):

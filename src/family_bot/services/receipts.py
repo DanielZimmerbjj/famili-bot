@@ -448,6 +448,7 @@ class ReceiptWorker:
                     category_id=category.id,
                     subcategory_id=subcategory.id if subcategory else None,
                     raw_name=item.raw_name[:500],
+                    display_name_ru=item.name_ru[:500],
                     quantity=quantize(item.quantity),
                     unit_price=quantize(item.unit_price) if item.unit_price is not None else None,
                     line_total=allocated_total,
@@ -530,7 +531,7 @@ class ReceiptWorker:
             sorted_items = sorted(receipt.items, key=lambda item: item.created_at)
             for index, item in enumerate(sorted_items, 1):
                 lines.append(
-                    f"{index}. {escape(item.raw_name)} — {format_money(item.line_total)} "
+                    f"{index}. {escape(item.display_name)} — {format_money(item.line_total)} "
                     f"{receipt.original_currency} → "
                     f"{names.get(item.category_id, 'Категория')}"
                 )
@@ -669,7 +670,7 @@ def prepare_chargeable_items(
         uncertain = item.confidence < confidence_threshold
         if item.category_key not in categories:
             if fallback_key not in categories:
-                raise ReceiptValidationError(f"Неизвестная категория для позиции {item.raw_name}")
+                raise ReceiptValidationError(f"Неизвестная категория для позиции {item.name_ru}")
             item = item.model_copy(update={"category_key": fallback_key, "subcategory_key": None})
             uncertain = True
         elif item.subcategory_key and (
@@ -680,7 +681,7 @@ def prepare_chargeable_items(
 
         prepared.append(item)
         if uncertain:
-            uncertain_names.append(item.raw_name)
+            uncertain_names.append(item.name_ru)
 
     if not prepared:
         raise ReceiptValidationError("В чеке не найдено оплаченных позиций")

@@ -38,7 +38,13 @@ class ReceiptExtractionError(RuntimeError):
 class ExtractedItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
-    raw_name: str
+    raw_name: str = Field(description="Item name exactly as printed on the receipt")
+    name_ru: str = Field(
+        description=(
+            "Short natural Russian translation of the item name for the user; "
+            "keep internationally recognizable brand names"
+        )
+    )
     quantity: PositiveDecimal
     # Receipts can contain gifts, promo rows, or fully discounted items with a
     # printed value of 0.00. They are valid receipt lines, just not expenses.
@@ -71,7 +77,7 @@ class ReceiptExtraction(BaseModel):
 
 
 class ReceiptExtractor:
-    schema_version = "1.0"
+    schema_version = "1.1"
 
     def __init__(
         self,
@@ -194,6 +200,12 @@ Rules:
 - Use null when merchant, date, subtotal, or unit price is not visible. Do not guess.
 - Set document_type to receipt only when this is a receipt; otherwise use not_receipt.
 - Extract all items, discounts and the final total. Do a second scan for missed lines.
+- raw_name must contain the item text exactly as printed, in its original language.
+- name_ru must be a short, natural Russian translation understandable to a Russian speaker.
+  Translate Thai, Vietnamese and every other non-Russian item name by meaning, not by
+  transliteration. Keep internationally recognizable brands such as Coca-Cola or Nestle.
+  Do not copy Thai or Vietnamese script into name_ru. If part of a name is unreadable,
+  describe the recognizable product type in Russian and add "(неразборчиво)".
 - category_key must be one of the keys below, or unknown.
 - subcategory_key must belong to its selected category, or be null.
 - confidence reflects visual certainty, not plausibility.

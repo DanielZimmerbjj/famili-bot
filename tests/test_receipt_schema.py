@@ -1,7 +1,8 @@
 import json
 from decimal import Decimal
 
-from family_bot.services.receipt_ai import ExtractedItem, ReceiptExtraction
+from family_bot.models import ReceiptItem
+from family_bot.services.receipt_ai import ExtractedItem, ReceiptExtraction, ReceiptExtractor
 
 
 def test_receipt_schema_has_all_fields_required_for_structured_output() -> None:
@@ -40,6 +41,7 @@ def test_receipt_schema_preserves_decimal_strings_exactly() -> None:
             "items": [
                 {
                     "raw_name": "Milk",
+                    "name_ru": "Молоко",
                     "quantity": "1",
                     "unit_price": "15.25",
                     "line_total": "15.25",
@@ -54,6 +56,8 @@ def test_receipt_schema_preserves_decimal_strings_exactly() -> None:
     )
     assert extraction.total == Decimal("15.25")
     assert extraction.items[0].unit_price == Decimal("15.25")
+    assert extraction.items[0].raw_name == "Milk"
+    assert extraction.items[0].name_ru == "Молоко"
 
 
 def test_receipt_schema_accepts_free_or_fully_discounted_item() -> None:
@@ -70,6 +74,7 @@ def test_receipt_schema_accepts_free_or_fully_discounted_item() -> None:
             "items": [
                 {
                     "raw_name": "Paid drink",
+                    "name_ru": "Напиток",
                     "quantity": "1",
                     "unit_price": "20",
                     "line_total": "20",
@@ -79,6 +84,7 @@ def test_receipt_schema_accepts_free_or_fully_discounted_item() -> None:
                 },
                 {
                     "raw_name": "Promotion gift",
+                    "name_ru": "Подарок по акции",
                     "quantity": "1",
                     "unit_price": "0.00",
                     "line_total": "0.00",
@@ -94,3 +100,20 @@ def test_receipt_schema_accepts_free_or_fully_discounted_item() -> None:
 
     assert extraction.items[1].unit_price == Decimal("0.00")
     assert extraction.items[1].line_total == Decimal("0.00")
+
+
+def test_receipt_prompt_requires_russian_item_names_without_thai_script() -> None:
+    prompt = ReceiptExtractor._prompt({"seven_eleven": ()}, {})
+
+    assert "name_ru" in prompt
+    assert "natural Russian translation" in prompt
+    assert "Do not copy Thai or Vietnamese script into name_ru" in prompt
+
+
+def test_receipt_item_uses_russian_name_and_keeps_legacy_fallback() -> None:
+    translated = ReceiptItem(raw_name="เนสท์เล่ ลาเต้", display_name_ru="Кофе Nestle Latte")
+    legacy = ReceiptItem(raw_name="Milk", display_name_ru=None)
+
+    assert translated.display_name == "Кофе Nestle Latte"
+    assert translated.raw_name == "เนสท์เล่ ลาเต้"
+    assert legacy.display_name == "Milk"

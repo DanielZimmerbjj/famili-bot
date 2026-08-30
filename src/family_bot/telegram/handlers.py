@@ -795,7 +795,7 @@ def build_router(deps: TelegramDependencies) -> Router:
                 sorted_items = sorted(receipt.items, key=lambda value: value.created_at)
                 for index, item in enumerate(sorted_items, 1):
                     lines.append(
-                        f"{index}. {escape(item.raw_name)} — {format_money(item.line_total)}"
+                        f"{index}. {escape(item.display_name)} — {format_money(item.line_total)}"
                     )
                 lines.append(
                     "\nОтветьте текстом или голосом, например:\n"
@@ -1284,7 +1284,7 @@ async def latest_expense_context(
         return None
     items = sorted(receipt.items, key=lambda item: item.created_at)
     item_context = "; ".join(
-        f"{index}. {item.raw_name}, {format_money(item.line_total)} "
+        f"{index}. {item.display_name}, {format_money(item.line_total)} "
         f"{receipt.original_currency or 'KZT'}"
         for index, item in enumerate(items, 1)
     )
@@ -1368,7 +1368,7 @@ async def correct_last_expense(
 
     if receipt_items:
         item_context = "; ".join(
-            f"{index}. {item.raw_name}, {format_money(item.line_total)} "
+            f"{index}. {item.display_name}, {format_money(item.line_total)} "
             f"{receipt.original_currency if receipt else ''}"
             for index, item in enumerate(receipt_items, 1)
         )
@@ -1422,11 +1422,12 @@ async def correct_last_expense(
                 target = items[target_number - 1]
                 before = {
                     "raw_name": target.raw_name,
+                    "display_name_ru": target.display_name_ru,
                     "line_total": str(target.line_total),
                     "category_id": target.category_id,
                 }
                 if correction.description:
-                    target.raw_name = correction.description[:500]
+                    target.display_name_ru = correction.description[:500]
                 if correction.amount is not None:
                     target.line_total = quantize(Decimal(str(correction.amount)))
                 if correction.currency and len(items) > 1:
@@ -1470,6 +1471,7 @@ async def correct_last_expense(
                         before_data=before,
                         after_data={
                             "raw_name": target.raw_name,
+                            "display_name_ru": target.display_name_ru,
                             "line_total": str(target.line_total),
                             "category_id": target.category_id,
                         },
@@ -1478,7 +1480,7 @@ async def correct_last_expense(
                 corrected_category = await session.get(Category, target.category_id)
                 response = (
                     f"✅ Исправил позицию {target_number}: "
-                    f"<b>{escape(target.raw_name)}</b> — {format_money(target.line_total)} "
+                    f"<b>{escape(target.display_name)}</b> — {format_money(target.line_total)} "
                     f"{currency} → {corrected_category.icon if corrected_category else ''} "
                     f"{corrected_category.name if corrected_category else 'категория'}.\n"
                     f"Новый итог чека: <b>{format_money(locked_receipt.original_total)} "
