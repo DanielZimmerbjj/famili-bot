@@ -16,7 +16,7 @@ from sqlalchemy.exc import IntegrityError
 from family_bot.config import Settings, get_settings
 from family_bot.database import Database
 from family_bot.models import ProcessedUpdate
-from family_bot.services.cycles import seed_default_household
+from family_bot.services.cycles import seed_all_households
 from family_bot.services.expense_ai import ExpenseInterpreter
 from family_bot.services.rates import RateService
 from family_bot.services.receipt_ai import ReceiptExtractor
@@ -105,8 +105,8 @@ def create_app() -> FastAPI:
         )
         if settings.auto_seed:
             async with database.session_factory() as session, session.begin():
-                household = await seed_default_household(session, settings)
-                if household is not None:
+                households = await seed_all_households(session, settings)
+                for household in households:
                     migrated_items = await backfill_seven_eleven_receipts(session, household)
                     if migrated_items:
                         logger.info(

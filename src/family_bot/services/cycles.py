@@ -119,6 +119,29 @@ async def seed_default_household(session: AsyncSession, settings: Settings) -> H
     )
 
 
+async def seed_all_households(session: AsyncSession, settings: Settings) -> list[Household]:
+    """Complete every persisted household, including groups not configured in ENV."""
+    seeded: dict[str, Household] = {}
+    default_household = await seed_default_household(session, settings)
+    if default_household is not None:
+        seeded[default_household.id] = default_household
+
+    existing = (
+        await session.scalars(select(Household).where(Household.active.is_(True)))
+    ).all()
+    for household in existing:
+        if household.id in seeded:
+            continue
+        completed = await seed_household(
+            session,
+            settings,
+            household.telegram_chat_id,
+            owner_user_id=None,
+        )
+        seeded[completed.id] = completed
+    return list(seeded.values())
+
+
 async def seed_household(
     session: AsyncSession,
     settings: Settings,
