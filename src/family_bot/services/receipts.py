@@ -5,7 +5,7 @@ import hashlib
 import logging
 from collections import defaultdict
 from contextlib import suppress
-from datetime import UTC, timedelta
+from datetime import UTC, datetime, timedelta, tzinfo
 from decimal import Decimal
 from html import escape
 from io import BytesIO
@@ -43,10 +43,44 @@ from family_bot.services.receipt_ai import (
 logger = logging.getLogger(__name__)
 
 REVIEW_WARNING_PREFIX = "budget_review:"
+MAX_RECEIPT_AGE = timedelta(days=62)
+MAX_RECEIPT_FUTURE_SKEW = timedelta(days=1)
 
 
 class ReceiptValidationError(ValueError):
     pass
+
+
+def normalize_purchased_at(
+    extracted_at: datetime | None,
+    received_at: datetime,
+    local_timezone: tzinfo,
+) -> datetime:
+    """Keep OCR date mistakes from breaking exchange-rate lookup and posting."""
+    if received_at.tzinfo is None:
+        received_local = received_at.replace(tzinfo=local_timezone)
+    else:
+        received_local = received_at.astimezone(local_timezone)
+    if extracted_at is None:
+        return received_local
+
+    if extracted_at.tzinfo is None:
+        candidate = extracted_at.replace(tzinfo=local_timezone)
+    else:
+        candidate = extracted_at.astimezone(local_timezone)
+
+    # Thai receipts can print years in the Buddhist calendar (Gregorian + 543).
+    if 2400 <= candidate.year <= 2700:
+        try:
+            candidate = candidate.replace(year=candidate.year - 543)
+        except ValueError:
+            return received_local
+
+    earliest = received_local - MAX_RECEIPT_AGE
+    latest = received_local + MAX_RECEIPT_FUTURE_SKEW
+    if not earliest <= candidate <= latest:
+        return received_local
+    return candidate
 
 
 class ReceiptService:
@@ -345,11 +379,11 @@ class ReceiptWorker:
             extraction.tax,
         )
 
-        purchased_at = extraction.purchased_at or receipt.created_at
-        if purchased_at.tzinfo is None:
-            purchased_at = purchased_at.replace(tzinfo=self.settings.timezone)
-        else:
-            purchased_at = purchased_at.astimezone(self.settings.timezone)
+        purchased_at = normalize_purchased_at(
+            extraction.purchased_at,
+            receipt.created_at,
+            self.settings.timezone,
+        )
         household = await session.get(Household, receipt.household_id)
         if household is None:
             raise RuntimeError("Household disappeared during receipt processing")

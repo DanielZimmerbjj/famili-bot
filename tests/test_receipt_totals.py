@@ -1,4 +1,6 @@
+from datetime import datetime
 from decimal import Decimal
+from zoneinfo import ZoneInfo
 
 import pytest
 
@@ -6,6 +8,7 @@ from family_bot.services.receipt_ai import ExtractedItem
 from family_bot.services.receipts import (
     ReceiptValidationError,
     allocate_receipt_total,
+    normalize_purchased_at,
     prepare_chargeable_items,
 )
 
@@ -93,3 +96,29 @@ def test_rejects_unreconciled_total() -> None:
             discount=Decimal("0"),
             tax=Decimal("0"),
         )
+
+
+def test_invalid_ocr_date_falls_back_to_receipt_upload_time() -> None:
+    timezone = ZoneInfo("Asia/Bangkok")
+    received_at = datetime(2026, 8, 30, 12, 0, tzinfo=timezone)
+
+    normalized = normalize_purchased_at(
+        datetime(3008, 3, 30, 0, 0),
+        received_at,
+        timezone,
+    )
+
+    assert normalized == received_at
+
+
+def test_thai_buddhist_year_is_converted_when_date_is_plausible() -> None:
+    timezone = ZoneInfo("Asia/Bangkok")
+    received_at = datetime(2026, 8, 30, 12, 0, tzinfo=timezone)
+
+    normalized = normalize_purchased_at(
+        datetime(2569, 8, 30, 10, 15),
+        received_at,
+        timezone,
+    )
+
+    assert normalized == datetime(2026, 8, 30, 10, 15, tzinfo=timezone)
