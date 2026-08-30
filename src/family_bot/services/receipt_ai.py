@@ -1,20 +1,47 @@
 from __future__ import annotations
 
 import base64
+import logging
 from datetime import datetime
 from decimal import Decimal
+from typing import Annotated
 
-from openai import AsyncOpenAI
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
+from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema, field_validator
+
+logger = logging.getLogger(__name__)
+
+# Pydantic's default JSON schema for Decimal contains a negative-lookahead regex.
+# OpenAI Structured Outputs deliberately supports only a safe regex subset, so that
+# schema is rejected before the model can inspect the receipt. Keep values as strings
+# in the wire schema and let Pydantic validate and convert them back to Decimal exactly.
+PositiveDecimal = Annotated[
+    Decimal,
+    Field(gt=0),
+    WithJsonSchema({"type": "string"}),
+]
+NonNegativeDecimal = Annotated[
+    Decimal,
+    Field(ge=0),
+    WithJsonSchema({"type": "string"}),
+]
+
+
+class ReceiptExtractionError(RuntimeError):
+    """OpenAI extraction failed after all configured models were attempted."""
+
+    def __init__(self, message: str, *, retryable: bool) -> None:
+        super().__init__(message)
+        self.retryable = retryable
 
 
 class ExtractedItem(BaseModel):
     model_config = ConfigDict(extra="forbid")
 
     raw_name: str
-    quantity: Decimal = Field(gt=0)
-    unit_price: Decimal | None = Field(gt=0)
-    line_total: Decimal = Field(gt=0)
+    quantity: PositiveDecimal
+    unit_price: PositiveDecimal | None
+    line_total: PositiveDecimal
     category_key: str
     subcategory_key: str | None
     confidence: float = Field(ge=0, le=1)
@@ -27,10 +54,10 @@ class ReceiptExtraction(BaseModel):
     merchant: str | None
     purchased_at: datetime | None
     currency: str
-    subtotal: Decimal | None
-    discount: Decimal = Field(ge=0)
-    tax: Decimal = Field(ge=0)
-    total: Decimal = Field(gt=0)
+    subtotal: NonNegativeDecimal | None
+    discount: NonNegativeDecimal
+    tax: NonNegativeDecimal
+    total: PositiveDecimal
     items: list[ExtractedItem]
     warnings: list[str]
     overall_confidence: float = Field(ge=0, le=1)
@@ -64,15 +91,26 @@ class ReceiptExtractor:
         if not images:
             raise ValueError("Receipt has no images")
         prompt = self._prompt(categories, known_aliases or {})
-        try:
-            return await self._extract_with_model(images, prompt, self.model), self.model
-        except Exception:
-            if self.fallback_model == self.model:
-                raise
-            return (
-                await self._extract_with_model(images, prompt, self.fallback_model),
-                self.fallback_model,
-            )
+        attempts: list[tuple[str, Exception]] = []
+        models = list(dict.fromkeys((self.model, self.fallback_model)))
+        for model in models:
+            try:
+                return await self._extract_with_model(images, prompt, model), model
+            except Exception as exc:
+                attempts.append((model, exc))
+                logger.warning(
+                    "Receipt extraction with model %s failed: %s",
+                    model,
+                    self._describe_error(exc),
+                )
+
+        details = "; ".join(
+            f"{model}: {self._describe_error(error)}" for model, error in attempts
+        )
+        raise ReceiptExtractionError(
+            details or "OpenAI receipt extraction failed",
+            retryable=any(self._is_retryable(error) for _, error in attempts),
+        ) from attempts[-1][1]
 
     async def _extract_with_model(
         self,
@@ -100,6 +138,34 @@ class ReceiptExtractor:
         if response.output_parsed is None:
             raise ValueError("OpenAI returned no parsed receipt")
         return response.output_parsed
+
+    @staticmethod
+    def _is_retryable(error: Exception) -> bool:
+        if isinstance(error, (APIConnectionError, APITimeoutError)):
+            return True
+        if isinstance(error, APIStatusError):
+            return error.status_code == 429 or error.status_code >= 500
+        # A malformed model response can be different on a later attempt.
+        return not isinstance(error, (TypeError, ValueError))
+
+    @staticmethod
+    def _describe_error(error: Exception) -> str:
+        if isinstance(error, APIStatusError):
+            body = getattr(error, "body", None)
+            if isinstance(body, dict):
+                payload = body.get("error", body)
+                if isinstance(payload, dict):
+                    message = str(payload.get("message") or type(error).__name__)
+                    code = payload.get("code")
+                    param = payload.get("param")
+                    suffix = ", ".join(
+                        str(value) for value in (code, param) if value not in (None, "")
+                    )
+                    return f"HTTP {error.status_code}: {message}" + (
+                        f" ({suffix})" if suffix else ""
+                    )
+            return f"HTTP {error.status_code}: {type(error).__name__}"
+        return f"{type(error).__name__}: {error}"
 
     @staticmethod
     def _prompt(

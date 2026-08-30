@@ -726,6 +726,21 @@ def build_router(deps: TelegramDependencies) -> Router:
             if receipt is None:
                 await callback.answer("Чек не найден", show_alert=True)
                 return
+            if action == "retry":
+                if receipt.status == "posted":
+                    await callback.answer("Чек уже проведён", show_alert=True)
+                    return
+                if receipt.status == "reversed":
+                    await callback.answer("Этот чек был удалён", show_alert=True)
+                    return
+                receipt.status = "retrying"
+                receipt.retry_count = 0
+                receipt.next_attempt_at = datetime.now(UTC)
+                receipt.error_message = None
+                await callback.answer("Чек снова в очереди")
+                await callback.message.edit_reply_markup(reply_markup=None)
+                await callback.message.reply("🔄 Повторно обрабатываю чек…")
+                return
             if action == "delete":
                 await session.execute(
                     update(LedgerEntry)

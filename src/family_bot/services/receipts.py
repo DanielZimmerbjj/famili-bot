@@ -33,7 +33,12 @@ from family_bot.models import (
 from family_bot.services.ledger import allocation_and_spend, post_expense
 from family_bot.services.money import normalize_currency, quantize
 from family_bot.services.rates import RateService, RateUnavailableError
-from family_bot.services.receipt_ai import ExtractedItem, ReceiptExtraction, ReceiptExtractor
+from family_bot.services.receipt_ai import (
+    ExtractedItem,
+    ReceiptExtraction,
+    ReceiptExtractionError,
+    ReceiptExtractor,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -133,20 +138,27 @@ class ReceiptWorker:
 
     async def run(self) -> None:
         logger.info("Receipt worker started")
-        await self._recover_inflight()
+        recovered = False
         while not self.stop_event.is_set():
-            receipt_id = await self._claim_next()
-            if receipt_id is None:
-                with suppress(TimeoutError):
-                    await asyncio.wait_for(
-                        self.stop_event.wait(), timeout=self.settings.receipt_poll_seconds
-                    )
-                continue
             try:
-                await self._process(receipt_id)
+                if not recovered:
+                    await self._recover_inflight()
+                    recovered = True
+                receipt_id = await self._claim_next()
+                if receipt_id is not None:
+                    await self._process(receipt_id)
+                    continue
+                await self._wait(self.settings.receipt_poll_seconds)
+            except asyncio.CancelledError:
+                raise
             except Exception:
-                logger.exception("Unexpected receipt worker failure for %s", receipt_id)
+                logger.exception("Receipt worker iteration failed; it will continue")
+                await self._wait(max(self.settings.receipt_poll_seconds, 1.0))
         logger.info("Receipt worker stopped")
+
+    async def _wait(self, timeout: float) -> None:
+        with suppress(TimeoutError):
+            await asyncio.wait_for(self.stop_event.wait(), timeout=timeout)
 
     async def stop(self) -> None:
         self.stop_event.set()
@@ -210,6 +222,14 @@ class ReceiptWorker:
             await self._mark_review(receipt_id, str(exc))
         except RateUnavailableError as exc:
             await self._mark_review(receipt_id, f"Нет курса: {exc}", status="rate_pending")
+        except ReceiptExtractionError as exc:
+            logger.error(
+                "Receipt %s extraction failed (retryable=%s): %s",
+                receipt_id,
+                exc.retryable,
+                exc,
+            )
+            await self._mark_failed(receipt_id, str(exc), force_terminal=not exc.retryable)
         except Exception as exc:
             logger.exception("Receipt %s processing failed", receipt_id)
             await self._mark_failed(receipt_id, str(exc))
@@ -474,13 +494,18 @@ class ReceiptWorker:
             receipt.error_message = message[:2000]
             chat_id = receipt.telegram_chat_id
             message_id = receipt.telegram_message_id
-        await self.bot.send_message(
-            chat_id,
-            f"⚠️ Чек пока не проведён: {escape(message)}",
-            reply_to_message_id=message_id,
-        )
+        try:
+            await self.bot.send_message(
+                chat_id,
+                f"⚠️ Чек пока не проведён: {escape(message)}",
+                reply_to_message_id=message_id,
+            )
+        except Exception:
+            logger.exception("Could not notify Telegram about receipt %s review", receipt_id)
 
-    async def _mark_failed(self, receipt_id: str, message: str) -> None:
+    async def _mark_failed(
+        self, receipt_id: str, message: str, *, force_terminal: bool = False
+    ) -> None:
         should_notify = False
         chat_id = 0
         message_id = 0
@@ -492,6 +517,8 @@ class ReceiptWorker:
             receipt.error_message = message[:2000]
             chat_id = receipt.telegram_chat_id
             message_id = receipt.telegram_message_id
+            if force_terminal:
+                receipt.retry_count = self.settings.receipt_retry_limit
             if receipt.retry_count >= self.settings.receipt_retry_limit:
                 receipt.status = "failed"
                 should_notify = True
@@ -499,11 +526,26 @@ class ReceiptWorker:
                 receipt.status = "retrying"
                 receipt.next_attempt_at = utcnow() + timedelta(seconds=2**receipt.retry_count * 10)
         if should_notify:
-            await self.bot.send_message(
-                chat_id,
-                "❌ Не удалось обработать чек после нескольких попыток. Он сохранён и не списан.",
-                reply_to_message_id=message_id,
+            keyboard = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🔄 Повторить",
+                            callback_data=f"receipt:retry:{receipt_id}",
+                        )
+                    ]
+                ]
             )
+            try:
+                await self.bot.send_message(
+                    chat_id,
+                    "❌ Не удалось обработать чек. "
+                    "Он сохранён и не списан. Бот продолжает работу.",
+                    reply_to_message_id=message_id,
+                    reply_markup=keyboard,
+                )
+            except Exception:
+                logger.exception("Could not notify Telegram about receipt %s failure", receipt_id)
 
 
 def format_money(value: Decimal | None) -> str:

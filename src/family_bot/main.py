@@ -166,6 +166,10 @@ def create_app() -> FastAPI:
         runtime: Runtime = request.app.state.runtime
         if runtime.polling_task is not None and runtime.polling_task.done():
             raise HTTPException(status_code=503, detail="Telegram polling stopped")
+        if runtime.worker_task.done():
+            raise HTTPException(status_code=503, detail="Receipt worker stopped")
+        if runtime.scheduler_task.done():
+            raise HTTPException(status_code=503, detail="Report scheduler stopped")
         async with runtime.database.session_factory() as session:
             await session.execute(text("SELECT 1"))
         return {"status": "ready"}
