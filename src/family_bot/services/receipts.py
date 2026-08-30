@@ -326,10 +326,16 @@ class ReceiptWorker:
             raise ReceiptValidationError("Не удалось прочитать положительный итог чека")
         if not extraction.items:
             raise ReceiptValidationError("Не удалось прочитать позиции чека")
+        # Keep zero-value promo/freebie rows valid at the AI boundary, but do not
+        # classify or post them as expenses. At least one paid row is required
+        # because the receipt total itself must be positive.
+        items = [item for item in extraction.items if item.line_total > 0]
+        if not items:
+            raise ReceiptValidationError("В чеке не найдено оплаченных позиций")
         currency = normalize_currency(extraction.currency)
         weak_items = [
             item
-            for item in extraction.items
+            for item in items
             if item.category_key not in categories
             or item.confidence < self.settings.receipt_review_confidence
         ]
@@ -337,7 +343,6 @@ class ReceiptWorker:
             names = ", ".join(item.raw_name for item in weak_items[:5])
             raise ReceiptValidationError(f"Нужно уточнить категории/текст: {names or 'весь чек'}")
 
-        items = list(extraction.items)
         allocated_totals = allocate_receipt_total(
             items,
             extraction.total,

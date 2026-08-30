@@ -40,8 +40,10 @@ class ExtractedItem(BaseModel):
 
     raw_name: str
     quantity: PositiveDecimal
-    unit_price: PositiveDecimal | None
-    line_total: PositiveDecimal
+    # Receipts can contain gifts, promo rows, or fully discounted items with a
+    # printed value of 0.00. They are valid receipt lines, just not expenses.
+    unit_price: NonNegativeDecimal | None
+    line_total: NonNegativeDecimal
     category_key: str
     subcategory_key: str | None
     confidence: float = Field(ge=0, le=1)

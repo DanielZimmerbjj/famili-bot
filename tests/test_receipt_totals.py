@@ -39,6 +39,16 @@ def test_accepts_tax_in_final_total() -> None:
     assert allocations == [Decimal("107.00000000")]
 
 
+def test_zero_value_promo_line_does_not_change_allocation() -> None:
+    allocations = allocate_receipt_total(
+        [item("Еда", "100"), item("Подарок по акции", "0")],
+        total=Decimal("100"),
+        discount=Decimal("0"),
+        tax=Decimal("0"),
+    )
+    assert allocations == [Decimal("100.00000000"), Decimal("0E-8")]
+
+
 def test_rejects_unreconciled_total() -> None:
     with pytest.raises(ReceiptValidationError):
         allocate_receipt_total(
