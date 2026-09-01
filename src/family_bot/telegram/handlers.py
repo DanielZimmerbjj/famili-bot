@@ -18,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from family_bot.config import Settings
+from family_bot.constants import SEVEN_ELEVEN_CATEGORY_KEY
 from family_bot.models import (
     AuditLog,
     BudgetCycle,
@@ -56,7 +57,11 @@ from family_bot.services.ledger import (
 from family_bot.services.money import CurrencyError, normalize_currency, quantize
 from family_bot.services.rates import RateService, RateUnavailableError
 from family_bot.services.receipt_images import infer_document_image_mime
-from family_bot.services.receipts import ReceiptService, format_money
+from family_bot.services.receipts import (
+    ReceiptService,
+    format_money,
+    is_seven_eleven_merchant,
+)
 from family_bot.services.reports import build_chart, build_report
 from family_bot.services.text_parser import match_category
 from family_bot.telegram.keyboards import cycle_close_keyboard, main_menu_keyboard
@@ -134,6 +139,11 @@ CLOSE_COMMAND_RE = simple_command_pattern(
         "все месяц закончен",
         "всё месяц закончен",
     ),
+)
+RECEIPT_CORRECTION_RE = re.compile(
+    r"(?:\bчек\w*|\bпозици\w*|\bтовар\w*|\bмагазин\w*|\breceipt\b|"
+    r"7[\s-]?(?:11|eleven)|seven[\s-]?eleven|севен[\s-]?элевен)",
+    re.IGNORECASE,
 )
 
 logger = logging.getLogger(__name__)
@@ -516,6 +526,8 @@ def build_router(deps: TelegramDependencies) -> Router:
             "• <code>такси 180 бат</code> — ручной расход.\n"
             "• <code>в 7-Eleven купил колу за 35 бат</code> — расход свободной фразой.\n"
             "• <code>нет, это было молоко</code> — исправление последнего расхода.\n"
+            "• <code>прошлый чек был не 7-Eleven, а Big C</code> — смена магазина.\n"
+            "• <code>итог прошлого чека был 220 бат</code> — исправление суммы чека.\n"
             "• <code>кафе 500000 донгов</code> — расход в другой валюте.\n"
             "• <code>получена зарплата 840000 тенге</code> — доход.\n"
             "• <code>отложил 600000 тенге на машину</code> — накопление.\n"
@@ -790,7 +802,8 @@ def build_router(deps: TelegramDependencies) -> Router:
             return
         _, action, receipt_id = callback.data.split(":", 2)
         if action == "confirm":
-            await callback.answer("Чек подтверждён")
+            # Compatibility for buttons already sent before confirmation was removed.
+            await callback.answer("Чек уже был учтён автоматически")
             await callback.message.edit_reply_markup(reply_markup=None)
             return
         async with deps.session_factory() as session, session.begin():
@@ -1096,7 +1109,7 @@ async def handle_natural_operation(
                     )
                 )
             ).all()
-            previous_context = await latest_expense_context(session, household.id, user_id)
+            previous_context = await latest_expense_context(session, household.id)
         categories = {category.key: category.name for category in category_models}
         category_by_key = {category.key: category for category in category_models}
         goals = {
@@ -1516,13 +1529,11 @@ async def update_goal_target(
 async def latest_expense_context(
     session: AsyncSession,
     household_id: str,
-    user_id: int,
 ) -> str | None:
     entry = await session.scalar(
         select(LedgerEntry)
         .where(
             LedgerEntry.household_id == household_id,
-            LedgerEntry.created_by_user_id == user_id,
             LedgerEntry.entry_type == "expense",
             LedgerEntry.status == "posted",
         )
@@ -1546,12 +1557,22 @@ async def latest_expense_context(
     if receipt is None:
         return None
     items = sorted(receipt.items, key=lambda item: item.created_at)
+    category_ids = {item.category_id for item in items if item.category_id}
+    categories = (
+        await session.scalars(select(Category).where(Category.id.in_(category_ids)))
+    ).all()
+    category_keys = {category.id: category.key for category in categories}
     item_context = "; ".join(
         f"{index}. {item.display_name}, {format_money(item.display_line_total)} "
-        f"{receipt.original_currency or 'KZT'}"
+        f"{receipt.original_currency or 'KZT'}, категория "
+        f"{category_keys.get(item.category_id, 'unknown')}"
         for index, item in enumerate(items, 1)
     )
-    return f"Чек: {item_context}"
+    return (
+        f"Чек магазина {receipt.merchant or 'не указан'}; итог "
+        f"{format_money(receipt.original_total)} {receipt.original_currency or 'KZT'}; "
+        f"позиции: {item_context}"
+    )
 
 
 async def build_expense_response(
@@ -1586,6 +1607,90 @@ async def build_expense_response(
     return "\n".join(lines)
 
 
+def correction_targets_receipt(
+    text: str,
+    interpretation: ExpenseInterpretation | None,
+) -> bool:
+    if RECEIPT_CORRECTION_RE.search(text):
+        return True
+    if interpretation is None:
+        return False
+    if interpretation.merchant or interpretation.receipt_total or interpretation.receipt_currency:
+        return True
+    return any(
+        item.target_item_number is not None or item.target_item_name
+        for item in interpretation.items
+    )
+
+
+def correction_has_changes(interpretation: ExpenseInterpretation) -> bool:
+    if interpretation.merchant or interpretation.receipt_total or interpretation.receipt_currency:
+        return True
+    return any(
+        item.description
+        or item.amount is not None
+        or item.currency
+        or item.category_key
+        for item in interpretation.items
+    )
+
+
+def resolve_corrected_receipt_item(
+    items: list[ReceiptItem],
+    correction: InterpretedExpenseItem,
+) -> tuple[int, ReceiptItem]:
+    if correction.target_item_number is not None:
+        index = correction.target_item_number - 1
+        if not 0 <= index < len(items):
+            raise ValueError("Неверный номер позиции чека")
+        return index + 1, items[index]
+    if correction.target_item_name:
+        target_name = " ".join(
+            re.sub(r"[^\w]+", " ", correction.target_item_name.casefold()).split()
+        )
+        matches: list[tuple[int, ReceiptItem]] = []
+        for index, item in enumerate(items, 1):
+            names = (item.display_name, item.raw_name)
+            normalized_names = [
+                " ".join(re.sub(r"[^\w]+", " ", name.casefold()).split())
+                for name in names
+            ]
+            if any(
+                target_name == name or target_name in name or name in target_name
+                for name in normalized_names
+                if name
+            ):
+                matches.append((index, item))
+        if len(matches) == 1:
+            return matches[0]
+        if len(matches) > 1:
+            raise ValueError("Название подходит к нескольким позициям; укажите номер")
+        raise ValueError("Не нашёл такую позицию в последнем чеке; укажите её номер")
+    if len(items) == 1:
+        return 1, items[0]
+    raise ValueError(
+        "В чеке несколько позиций. Укажите номер или название, например: "
+        "«позиция 2 — молоко»"
+    )
+
+
+def reallocate_receipt_total(items: list[ReceiptItem], new_total: Decimal) -> None:
+    current_total = sum((Decimal(item.line_total) for item in items), Decimal("0"))
+    if new_total <= 0 or current_total <= 0:
+        raise ValueError("Итог чека и сумма позиций должны быть положительными")
+    allocations = [
+        quantize(new_total * Decimal(item.line_total) / current_total) for item in items
+    ]
+    residual = quantize(new_total) - sum(allocations, Decimal("0"))
+    if residual:
+        largest_index = max(
+            range(len(items)), key=lambda index: Decimal(items[index].line_total)
+        )
+        allocations[largest_index] = quantize(allocations[largest_index] + residual)
+    for item, allocation in zip(items, allocations, strict=True):
+        item.line_total = allocation
+
+
 async def correct_last_expense(
     message: Message,
     deps: TelegramDependencies,
@@ -1595,21 +1700,8 @@ async def correct_last_expense(
     interpretation: ExpenseInterpretation | None = None,
     source_event_key: str | None = None,
 ) -> None:
+    receipt_request = correction_targets_receipt(text, interpretation)
     async with deps.session_factory() as session:
-        last_entry = await session.scalar(
-            select(LedgerEntry)
-            .where(
-                LedgerEntry.household_id == household.id,
-                LedgerEntry.created_by_user_id == user_id,
-                LedgerEntry.entry_type == "expense",
-                LedgerEntry.status == "posted",
-            )
-            .order_by(LedgerEntry.created_at.desc())
-            .limit(1)
-        )
-        if last_entry is None:
-            await message.reply("Не нашёл ваш последний расход для исправления.")
-            return
         category_models = (
             await session.scalars(
                 select(Category).where(
@@ -1618,96 +1710,208 @@ async def correct_last_expense(
                 )
             )
         ).all()
-        previous_category = await session.get(Category, last_entry.category_id)
         receipt = None
-        receipt_items: list[ReceiptItem] = []
-        if last_entry.receipt_id:
+        if receipt_request:
             receipt = await session.scalar(
                 select(Receipt)
-                .where(Receipt.id == last_entry.receipt_id)
+                .where(
+                    Receipt.household_id == household.id,
+                    Receipt.status == "posted",
+                )
                 .options(selectinload(Receipt.items))
+                .order_by(Receipt.posted_at.desc(), Receipt.created_at.desc())
+                .limit(1)
             )
-            if receipt is not None:
-                receipt_items = sorted(receipt.items, key=lambda item: item.created_at)
+        last_entry = None
+        if receipt is not None:
+            last_entry = await session.scalar(
+                select(LedgerEntry)
+                .where(
+                    LedgerEntry.receipt_id == receipt.id,
+                    LedgerEntry.entry_type == "expense",
+                    LedgerEntry.status == "posted",
+                )
+                .order_by(LedgerEntry.created_at.desc())
+                .limit(1)
+            )
+        else:
+            last_entry = await session.scalar(
+                select(LedgerEntry)
+                .where(
+                    LedgerEntry.household_id == household.id,
+                    LedgerEntry.entry_type == "expense",
+                    LedgerEntry.status == "posted",
+                )
+                .order_by(LedgerEntry.created_at.desc())
+                .limit(1)
+            )
+            if last_entry is not None and last_entry.receipt_id:
+                receipt = await session.scalar(
+                    select(Receipt)
+                    .where(Receipt.id == last_entry.receipt_id)
+                    .options(selectinload(Receipt.items))
+                )
+        if receipt_request and receipt is None:
+            await message.reply("Не нашёл последний проведённый чек для исправления.")
+            return
+        if last_entry is None and receipt is None:
+            await message.reply("Не нашёл последний расход для исправления.")
+            return
 
-    if receipt_items:
+        receipt_items = (
+            sorted(receipt.items, key=lambda item: item.created_at) if receipt else []
+        )
+        previous_category = (
+            await session.get(Category, last_entry.category_id) if last_entry else None
+        )
+
+    if receipt_items and receipt is not None:
+        category_key_by_id = {category.id: category.key for category in category_models}
         item_context = "; ".join(
             f"{index}. {item.display_name}, {format_money(item.display_line_total)} "
-            f"{receipt.original_currency if receipt else ''}"
+            f"{receipt.original_currency or 'KZT'}, категория "
+            f"{category_key_by_id.get(item.category_id, 'unknown')}"
             for index, item in enumerate(receipt_items, 1)
         )
-        previous_context = f"Чек: {item_context}"
-    else:
+        previous_context = (
+            f"Чек магазина {receipt.merchant or 'не указан'}; итог "
+            f"{format_money(receipt.original_total)} {receipt.original_currency or 'KZT'}; "
+            f"позиции: {item_context}"
+        )
+    elif last_entry is not None:
         previous_context = (
             f"Расход: {last_entry.description}; {last_entry.original_amount} "
             f"{last_entry.original_currency}; категория "
             f"{previous_category.key if previous_category else 'unknown'}"
         )
+    else:
+        previous_context = "none"
+
     categories = {category.key: category.name for category in category_models}
     interpretation = interpretation or await deps.expense_interpreter.interpret(
         text, categories, previous_context
     )
-    if interpretation.kind != "correction" or not interpretation.items:
+    if interpretation.kind != "correction" or not correction_has_changes(interpretation):
         await message.reply(
-            "Не понял, что именно исправить. Например: <i>«нет, это было молоко»</i>."
+            "Не понял, что именно исправить. Например: "
+            "<i>«прошлый чек был не 7-Eleven, а Big C»</i>."
         )
         return
-    correction = interpretation.items[0]
+    correction = interpretation.items[0] if interpretation.items else None
     category_by_key = {category.key: category for category in category_models}
 
     try:
         async with deps.session_factory() as session, session.begin():
-            locked_entry = await session.scalar(
-                select(LedgerEntry).where(LedgerEntry.id == last_entry.id).with_for_update()
-            )
-            if locked_entry is None or locked_entry.status != "posted":
-                await message.reply("Расход уже изменён или удалён.")
-                return
-            if locked_entry.receipt_id:
+            if receipt is not None:
                 locked_receipt = await session.scalar(
                     select(Receipt)
-                    .where(Receipt.id == locked_entry.receipt_id)
+                    .where(
+                        Receipt.id == receipt.id,
+                        Receipt.household_id == household.id,
+                        Receipt.status == "posted",
+                    )
                     .options(selectinload(Receipt.items))
                     .with_for_update()
                 )
                 if locked_receipt is None:
-                    raise ValueError("Чек не найден")
+                    raise ValueError("Чек уже изменён или удалён")
                 items = sorted(locked_receipt.items, key=lambda item: item.created_at)
-                target_number = correction.target_item_number
-                if len(items) > 1 and target_number is None:
-                    await message.reply(
-                        "В чеке несколько позиций. Укажите номер, например: "
-                        "<i>«нет, позиция 2 — молоко»</i>."
-                    )
-                    return
-                target_number = target_number or 1
-                if not 1 <= target_number <= len(items):
-                    raise ValueError("Неверный номер позиции чека")
-                target = items[target_number - 1]
-                before = {
-                    "raw_name": target.raw_name,
-                    "display_name_ru": target.display_name_ru,
-                    "printed_line_total": str(target.printed_line_total),
-                    "line_total": str(target.line_total),
-                    "category_id": target.category_id,
+                if not items:
+                    raise ValueError("В чеке нет позиций")
+                before_data = {
+                    "merchant": locked_receipt.merchant,
+                    "total": str(locked_receipt.original_total),
+                    "currency": locked_receipt.original_currency,
+                    "items": [
+                        {
+                            "id": item.id,
+                            "name": item.display_name,
+                            "line_total": str(item.line_total),
+                            "category_id": item.category_id,
+                        }
+                        for item in items
+                    ],
                 }
-                if correction.description:
-                    target.display_name_ru = correction.description[:500]
-                if correction.amount is not None:
-                    corrected_amount = quantize(Decimal(str(correction.amount)))
-                    target.printed_line_total = corrected_amount
-                    target.line_total = corrected_amount
-                if correction.currency and len(items) > 1:
-                    raise ValueError("Валюту можно менять только у чека с одной позицией")
+                changes: list[str] = []
+                old_merchant = locked_receipt.merchant
+                if interpretation.merchant:
+                    new_merchant = interpretation.merchant.strip()[:200]
+                    if new_merchant and new_merchant != old_merchant:
+                        locked_receipt.merchant = new_merchant
+                        changes.append(
+                            f"магазин: <b>{escape(old_merchant or 'не указан')}</b> → "
+                            f"<b>{escape(new_merchant)}</b>"
+                        )
+
+                        seven_category = category_by_key.get(SEVEN_ELEVEN_CATEGORY_KEY)
+                        if is_seven_eleven_merchant(new_merchant) and seven_category:
+                            for item in items:
+                                item.category_id = seven_category.id
+                                item.subcategory_id = None
+                            changes.append("все позиции перенесены в 🏪 7-Eleven")
+                        elif is_seven_eleven_merchant(old_merchant):
+                            fallback_category = category_by_key.get("groceries_household")
+                            if fallback_category is None:
+                                raise ValueError("Не найдена категория продуктов")
+                            moved = 0
+                            for item in items:
+                                if seven_category is None or item.category_id == seven_category.id:
+                                    item.category_id = fallback_category.id
+                                    item.subcategory_id = None
+                                    moved += 1
+                            if moved:
+                                changes.append(
+                                    f"{moved} поз. перенесено в {fallback_category.icon} "
+                                    f"{escape(fallback_category.name)}"
+                                )
+
+                target_number: int | None = None
+                target: ReceiptItem | None = None
+                if correction is not None and any(
+                    (
+                        correction.description,
+                        correction.amount is not None,
+                        correction.currency,
+                        correction.category_key,
+                    )
+                ):
+                    target_number, target = resolve_corrected_receipt_item(items, correction)
+                    if correction.description:
+                        target.display_name_ru = correction.description[:500]
+                    if correction.amount is not None:
+                        corrected_amount = quantize(Decimal(str(correction.amount)))
+                        target.printed_line_total = corrected_amount
+                        target.line_total = corrected_amount
+                    if correction.currency and len(items) > 1:
+                        raise ValueError(
+                            "Валюту отдельной позиции нельзя менять внутри общего чека"
+                        )
+                    if correction.category_key:
+                        corrected_category = category_by_key.get(correction.category_key)
+                        if corrected_category is None:
+                            raise ValueError("Категория не найдена")
+                        target.category_id = corrected_category.id
+                        target.subcategory_id = None
+
+                if interpretation.receipt_total is not None:
+                    corrected_total = quantize(Decimal(str(interpretation.receipt_total)))
+                    reallocate_receipt_total(items, corrected_total)
+                    corrected_currency = normalize_currency(
+                        interpretation.receipt_currency
+                        or locked_receipt.original_currency
+                        or "KZT"
+                    )
+                    changes.append(
+                        f"итог чека: <b>{format_money(corrected_total)} "
+                        f"{corrected_currency}</b>"
+                    )
+
                 currency = normalize_currency(
-                    correction.currency or locked_receipt.original_currency or "KZT"
+                    interpretation.receipt_currency
+                    or (correction.currency if correction else None)
+                    or locked_receipt.original_currency
+                    or "KZT"
                 )
-                if correction.category_key:
-                    corrected_category = category_by_key.get(correction.category_key)
-                    if corrected_category is None:
-                        raise ValueError("Категория не найдена")
-                    target.category_id = corrected_category.id
-                    target.subcategory_id = None
                 occurred_at = locked_receipt.purchased_at or locked_receipt.created_at
                 local_date = occurred_at.astimezone(deps.settings.timezone).date()
                 source_rate = await deps.rate_service.get_quote(session, currency, local_date)
@@ -1721,41 +1925,79 @@ async def correct_last_expense(
                     )
                     item.envelope_amount = envelope_rate.from_kzt(item.amount_kzt)
                     item.envelope_currency = item_category.envelope_currency
+
                 locked_receipt.original_currency = currency
                 locked_receipt.original_total = quantize(
                     sum((Decimal(item.line_total) for item in items), Decimal("0"))
                 )
                 locked_receipt.total_kzt = source_rate.to_kzt(locked_receipt.original_total)
                 locked_receipt.exchange_rate_id = source_rate.rate_id
-                await rebuild_receipt_ledger(session, household, locked_receipt, user_id)
+                if locked_receipt.extraction:
+                    stored_extraction = dict(locked_receipt.extraction)
+                    stored_extraction.update(
+                        {
+                            "merchant": locked_receipt.merchant,
+                            "currency": currency,
+                            "total": str(locked_receipt.original_total),
+                        }
+                    )
+                    locked_receipt.extraction = stored_extraction
+                await rebuild_receipt_ledger(
+                    session,
+                    household,
+                    locked_receipt,
+                    user_id,
+                    source_event_key=source_event_key,
+                )
                 session.add(
                     AuditLog(
                         household_id=household.id,
                         actor_user_id=user_id,
-                        action="receipt_item_natural_correction",
-                        entity_type="receipt_item",
-                        entity_id=target.id,
-                        before_data=before,
+                        action="receipt_natural_correction",
+                        entity_type="receipt",
+                        entity_id=locked_receipt.id,
+                        before_data=before_data,
                         after_data={
-                            "raw_name": target.raw_name,
-                            "display_name_ru": target.display_name_ru,
-                            "printed_line_total": str(target.printed_line_total),
-                            "line_total": str(target.line_total),
-                            "category_id": target.category_id,
+                            "merchant": locked_receipt.merchant,
+                            "total": str(locked_receipt.original_total),
+                            "currency": locked_receipt.original_currency,
+                            "items": [
+                                {
+                                    "id": item.id,
+                                    "name": item.display_name,
+                                    "line_total": str(item.line_total),
+                                    "category_id": item.category_id,
+                                }
+                                for item in items
+                            ],
                         },
                     )
                 )
-                corrected_category = await session.get(Category, target.category_id)
-                response = (
-                    f"✅ Исправил позицию {target_number}: "
-                    f"<b>{escape(target.display_name)}</b> — "
-                    f"{format_money(target.display_line_total)} "
-                    f"{currency} → {corrected_category.icon if corrected_category else ''} "
-                    f"{corrected_category.name if corrected_category else 'категория'}.\n"
-                    f"Новый итог чека: <b>{format_money(locked_receipt.original_total)} "
-                    f"{currency}</b> · {format_money(locked_receipt.total_kzt)} ₸"
+                if target is not None and target_number is not None:
+                    corrected_category = await session.get(Category, target.category_id)
+                    changes.append(
+                        f"позиция {target_number}: <b>{escape(target.display_name)}</b> — "
+                        f"{format_money(target.display_line_total)} {currency} → "
+                        f"{corrected_category.icon if corrected_category else ''} "
+                        f"{escape(corrected_category.name) if corrected_category else 'категория'}"
+                    )
+                response = "✅ <b>Исправил прошлый чек</b>"
+                if changes:
+                    response += "\n" + "\n".join(f"• {change}" for change in changes)
+                response += (
+                    f"\nНовый итог: <b>{format_money(locked_receipt.original_total)} "
+                    f"{currency}</b> · {format_money(locked_receipt.total_kzt)} ₸. "
+                    "Расходы и остатки в базе пересчитаны."
                 )
             else:
+                if last_entry is None or correction is None:
+                    raise ValueError("Последний расход не найден")
+                locked_entry = await session.scalar(
+                    select(LedgerEntry).where(LedgerEntry.id == last_entry.id).with_for_update()
+                )
+                if locked_entry is None or locked_entry.status != "posted":
+                    await message.reply("Расход уже изменён или удалён.")
+                    return
                 category = (
                     category_by_key.get(correction.category_key)
                     if correction.category_key
@@ -1944,6 +2186,8 @@ async def rebuild_receipt_ledger(
     household: Household,
     receipt: Receipt,
     user_id: int,
+    *,
+    source_event_key: str | None = None,
 ) -> None:
     await session.execute(
         update(LedgerEntry)
@@ -1958,7 +2202,7 @@ async def rebuild_receipt_ledger(
         await session.scalars(select(Category).where(Category.id.in_(grouped.keys())))
     ).all()
     category_by_id = {category.id: category for category in categories}
-    for category_id, items in grouped.items():
+    for source_item_index, (category_id, items) in enumerate(grouped.items()):
         category = category_by_id[category_id]
         session.add(
             LedgerEntry(
@@ -1978,5 +2222,7 @@ async def rebuild_receipt_ledger(
                 exchange_rate_id=receipt.exchange_rate_id,
                 occurred_at=receipt.purchased_at or receipt.created_at,
                 created_by_user_id=user_id,
+                source_event_key=source_event_key,
+                source_item_index=source_item_index if source_event_key else None,
             )
         )

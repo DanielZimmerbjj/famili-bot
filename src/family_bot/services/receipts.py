@@ -633,13 +633,13 @@ class ReceiptWorker:
                     f"{category.icon} {category.name}: осталось "
                     f"<b>{format_money(limit - spent)} {category.envelope_currency}</b>"
                 )
-            lines.append("Неверно? Ответьте текстом или голосом: <i>«нет, позиция 1 — молоко»</i>.")
+            lines.append(
+                "Чек уже учтён автоматически. Неверно? Ответьте текстом или голосом: "
+                "<i>«нет, позиция 1 — молоко»</i>."
+            )
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
-                        InlineKeyboardButton(
-                            text="✅ Верно", callback_data=f"receipt:confirm:{receipt.id}"
-                        ),
                         InlineKeyboardButton(
                             text="✏️ Исправить", callback_data=f"receipt:edit:{receipt.id}"
                         ),

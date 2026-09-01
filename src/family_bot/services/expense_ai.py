@@ -19,6 +19,7 @@ class InterpretedExpenseItem(BaseModel):
     target_amount: float | None = Field(default=None, gt=0)
     target_currency: str | None = None
     target_item_number: int | None = Field(default=None, ge=1)
+    target_item_name: str | None = None
     confidence: float = Field(ge=0, le=1)
 
     @field_validator("currency")
@@ -47,8 +48,15 @@ class ExpenseInterpretation(BaseModel):
         "other",
     ]
     merchant: str | None = None
+    receipt_total: float | None = Field(default=None, gt=0)
+    receipt_currency: str | None = None
     items: list[InterpretedExpenseItem]
     overall_confidence: float = Field(ge=0, le=1)
+
+    @field_validator("receipt_currency")
+    @classmethod
+    def receipt_currency_upper(cls, value: str | None) -> str | None:
+        return value.strip().upper() if value else None
 
 
 class ExpenseInterpreter:
@@ -173,7 +181,16 @@ Rules:
   "сколько денег осталось" and "как у нас дела с накоплениями" are reports, not other.
 - For a correction, return only values that change; null means keep the previous value.
   Do not use correction for editing a savings goal; use goal_update.
-- target_item_number is only for correcting a numbered receipt item.
+- A receipt correction does not need confirmation first: it edits the already-posted
+  previous receipt in the database.
+- For a correction of the receipt store/merchant, put the corrected store name in the
+  top-level merchant field. Example: "прошлый чек был не 7-Eleven, а Big C" means
+  merchant="Big C" and may have an empty items list.
+- When the user corrects the final total of the whole receipt, put it in receipt_total and
+  put its currency in receipt_currency. Do not invent a fake line item for the total.
+- target_item_number is only for correcting a numbered receipt item. When the user names
+  an existing item instead of its number, put that old/current name in target_item_name;
+  description is the corrected replacement name.
 - category_key must be one of the allowed keys. A purchase explicitly made at 7-Eleven,
   7-11 or Seven Eleven always uses seven_eleven regardless of the purchased items.
   Classify other supermarket drinks, milk and snacks as groceries_household unless the

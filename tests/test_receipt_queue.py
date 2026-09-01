@@ -1,12 +1,13 @@
 import asyncio
-from datetime import date
+from datetime import UTC, date, datetime
+from decimal import Decimal
 from unittest.mock import AsyncMock
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from family_bot.config import Settings
-from family_bot.models import Base, Receipt, ReceiptImage
+from family_bot.models import Base, Category, Receipt, ReceiptImage, ReceiptItem
 from family_bot.services.cycles import get_current_cycle, seed_default_household
 from family_bot.services.receipts import ReceiptService, ReceiptWorker
 
@@ -313,4 +314,69 @@ async def test_posted_receipt_confirmation_is_retried_after_telegram_failure() -
         assert saved.confirmation_status == "retrying"
         assert saved.confirmation_retry_count == 1
         assert saved.error_message == "Telegram unavailable"
+    await engine.dispose()
+
+
+async def test_posted_receipt_is_reported_without_confirmation_button() -> None:
+    engine, factory, settings = await queue_context()
+    async with factory() as session, session.begin():
+        household = await seed_default_household(session, settings)
+        assert household is not None
+        cycle = await get_current_cycle(session, household, date(2026, 8, 29), 5)
+        category = await session.scalar(
+            select(Category).where(
+                Category.household_id == household.id,
+                Category.key == "seven_eleven",
+            )
+        )
+        assert category is not None
+        receipt = Receipt(
+            household_id=household.id,
+            cycle_id=cycle.id,
+            telegram_chat_id=-100123,
+            telegram_message_id=50,
+            created_by_user_id=42,
+            status="posted",
+            merchant="7-Eleven",
+            purchased_at=datetime(2026, 8, 29, tzinfo=UTC),
+            original_currency="THB",
+            original_total=Decimal("124"),
+            total_kzt=Decimal("1749.64"),
+            confirmation_status="sending",
+            posted_at=datetime(2026, 8, 29, tzinfo=UTC),
+        )
+        session.add(receipt)
+        await session.flush()
+        session.add(
+            ReceiptItem(
+                receipt_id=receipt.id,
+                category_id=category.id,
+                raw_name="Milk",
+                display_name_ru="Молоко",
+                quantity=Decimal("1"),
+                printed_line_total=Decimal("124"),
+                line_total=Decimal("124"),
+                amount_kzt=Decimal("1749.64"),
+                envelope_amount=Decimal("124"),
+                envelope_currency="THB",
+                confidence=Decimal("0.99"),
+            )
+        )
+        receipt_id = receipt.id
+
+    bot = AsyncMock()
+    worker = ReceiptWorker(settings, factory, bot, object(), object())  # type: ignore[arg-type]
+    await worker._send_confirmation(receipt_id)
+
+    sent = bot.send_message.await_args
+    assert "Чек уже учтён автоматически" in sent.args[1]
+    callbacks = [
+        button.callback_data
+        for row in sent.kwargs["reply_markup"].inline_keyboard
+        for button in row
+    ]
+    assert callbacks == [
+        f"receipt:edit:{receipt_id}",
+        f"receipt:delete:{receipt_id}",
+    ]
     await engine.dispose()

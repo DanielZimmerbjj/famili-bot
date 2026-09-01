@@ -39,6 +39,30 @@ def test_interpreter_prompt_keeps_same_amount_for_correction() -> None:
     assert "groceries_household" in prompt
 
 
+def test_interpreter_prompt_supports_receipt_merchant_total_and_named_item() -> None:
+    interpreter = ExpenseInterpreter(
+        api_key="test",
+        intent_model="test-model",
+        fallback_model="test-model",
+        transcription_model="test-transcription",
+        default_currency="THB",
+    )
+    prompt = interpreter._prompt(
+        "прошлый чек был не 7-Eleven, а Big C, итог был 220 бат",
+        {
+            "seven_eleven": "7-Eleven",
+            "groceries_household": "Продукты",
+        },
+        "Чек магазина 7-Eleven; итог 124 THB",
+    )
+
+    assert 'merchant="Big C"' in prompt
+    assert "receipt_total" in prompt
+    assert "receipt_currency" in prompt
+    assert "target_item_name" in prompt
+    assert "does not need confirmation" in prompt
+
+
 def test_interpretation_supports_income_and_savings() -> None:
     income = ExpenseInterpretation(
         kind="income",
