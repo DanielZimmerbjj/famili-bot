@@ -9,10 +9,17 @@ import matplotlib
 
 matplotlib.use("Agg")
 import matplotlib.pyplot as plt  # noqa: E402
-from sqlalchemy import func, select
+from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from family_bot.models import BudgetCycle, Household, LedgerEntry, Receipt, SavingsGoal
+from family_bot.models import (
+    BudgetCycle,
+    Category,
+    Household,
+    LedgerEntry,
+    Receipt,
+    SavingsGoal,
+)
 from family_bot.services.ledger import (
     allocation_and_spend,
     cycle_close_breakdown,
@@ -72,11 +79,13 @@ async def build_report(
         )
         or 0
     )
-    pending_count = int(
+    problem_count = int(
         await session.scalar(
             select(func.count(Receipt.id)).where(
                 Receipt.household_id == household.id,
                 Receipt.status.in_(("needs_review", "failed", "rate_pending")),
+                Receipt.created_at >= day_start_local.astimezone(UTC),
+                Receipt.created_at <= day_end_local.astimezone(UTC),
             )
         )
         or 0
@@ -120,10 +129,15 @@ async def build_report(
         f"🌙 <b>Итоги за {local_date.strftime('%d.%m.%Y')}</b>",
         "",
         f"Сегодня потрачено: <b>{format_money(day_spent_kzt)} ₸</b>",
-        f"Чеков: {receipt_count} · На проверке: {pending_count}",
+        f"Чеков сегодня: {receipt_count}",
         "",
         "<b>Бюджет месяца</b>",
     ]
+    if problem_count:
+        lines.insert(
+            4,
+            f"С ошибкой обработки сегодня: {problem_count} · подтверждение не требуется",
+        )
     for category, limit, spent in rows:
         remaining = limit - spent
         remainder_text = (
@@ -189,6 +203,114 @@ async def build_report(
             ]
         )
     return "\n".join(lines)
+
+
+async def build_spending_answer(
+    session: AsyncSession,
+    household: Household,
+    cycle: BudgetCycle,
+    local_date: date,
+    period: str,
+    focus: str,
+) -> str:
+    """Build a short, exact answer to a conversational spending question."""
+
+    filters = [
+        LedgerEntry.household_id == household.id,
+        LedgerEntry.entry_type == "expense",
+        LedgerEntry.status == "posted",
+    ]
+    period_label = "Сегодня"
+    if period == "today":
+        day_start_local = datetime.combine(local_date, time.min).replace(
+            tzinfo=ZoneInfo(household.timezone)
+        )
+        day_end_local = datetime.combine(local_date, time.max).replace(
+            tzinfo=day_start_local.tzinfo
+        )
+        filters.extend(
+            [
+                LedgerEntry.occurred_at >= day_start_local.astimezone(UTC),
+                LedgerEntry.occurred_at <= day_end_local.astimezone(UTC),
+            ]
+        )
+    else:
+        period_label = "В этом финансовом месяце"
+        filters.append(LedgerEntry.cycle_id == cycle.id)
+
+    category_rows = (
+        await session.execute(
+            select(
+                Category.name,
+                Category.icon,
+                Category.envelope_currency,
+                func.coalesce(func.sum(LedgerEntry.envelope_amount), 0),
+                func.coalesce(func.sum(LedgerEntry.amount_kzt), 0),
+            )
+            .join(Category, Category.id == LedgerEntry.category_id)
+            .where(*filters)
+            .group_by(
+                Category.id,
+                Category.name,
+                Category.icon,
+                Category.envelope_currency,
+            )
+            .order_by(desc(func.sum(LedgerEntry.amount_kzt)))
+        )
+    ).all()
+    total_kzt = sum((Decimal(row[4]) for row in category_rows), Decimal("0"))
+    if not category_rows:
+        return f"{period_label} расходов пока нет."
+
+    def category_amount(row: tuple[object, ...]) -> str:
+        envelope_amount = Decimal(row[3])
+        envelope_currency = str(row[2])
+        amount_kzt = Decimal(row[4])
+        return (
+            f"{format_money(envelope_amount)} {envelope_currency} "
+            f"(≈ {format_money(amount_kzt)} ₸)"
+        )
+
+    if focus == "largest_category":
+        largest = category_rows[0]
+        return (
+            f"{period_label} больше всего ушло на {largest[1]} "
+            f"<b>{largest[0]}</b> — {category_amount(largest)}.\n"
+            f"Всего расходов: <b>{format_money(total_kzt)} ₸</b>."
+        )
+
+    if focus == "recent_expenses":
+        recent_rows = (
+            await session.execute(
+                select(LedgerEntry, Category)
+                .join(Category, Category.id == LedgerEntry.category_id)
+                .where(*filters)
+                .order_by(LedgerEntry.occurred_at.desc(), LedgerEntry.created_at.desc())
+                .limit(5)
+            )
+        ).all()
+        lines = [f"{period_label} последние расходы:"]
+        lines.extend(
+            f"• {category.icon} {entry.description}: "
+            f"{format_money(entry.original_amount)} {entry.original_currency}"
+            for entry, category in recent_rows
+        )
+        lines.append(f"Всего: <b>{format_money(total_kzt)} ₸</b>.")
+        return "\n".join(lines)
+
+    if focus == "category_breakdown":
+        lines = [f"{period_label} расходы по категориям:"]
+        lines.extend(
+            f"• {row[1]} {row[0]} — {category_amount(row)}" for row in category_rows[:7]
+        )
+        lines.append(f"Всего: <b>{format_money(total_kzt)} ₸</b>.")
+        return "\n".join(lines)
+
+    largest = category_rows[0]
+    return (
+        f"{period_label} потрачено <b>{format_money(total_kzt)} ₸</b>.\n"
+        f"Больше всего — {largest[1]} {largest[0]}: {category_amount(largest)}."
+    )
 
 
 async def build_chart(session: AsyncSession, cycle: BudgetCycle) -> bytes:

@@ -114,4 +114,8 @@ def test_interpreter_prompt_delegates_all_financial_kinds_to_ai() -> None:
     assert "new_goal_name" in prompt
     assert "kind=report" in prompt
     assert "скинь отчет" in prompt
+    assert '"240 бат 7/11"' in prompt
+    assert "today/largest_category" in prompt
+    assert "report_period" in prompt
+    assert "report_focus" in prompt
     assert "Never turn an ordinary conversation into a financial operation" in prompt

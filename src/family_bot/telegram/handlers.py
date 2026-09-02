@@ -62,7 +62,7 @@ from family_bot.services.receipts import (
     format_money,
     is_seven_eleven_merchant,
 )
-from family_bot.services.reports import build_chart, build_report
+from family_bot.services.reports import build_chart, build_report, build_spending_answer
 from family_bot.services.text_parser import match_category
 from family_bot.telegram.keyboards import cycle_close_keyboard, main_menu_keyboard
 
@@ -1155,13 +1155,24 @@ async def handle_natural_operation(
                     local_now.date(),
                     deps.settings.financial_cycle_start_day,
                 )
-                report = await build_report(
-                    session,
-                    deps.rate_service,
-                    household,
-                    cycle,
-                    local_now.date(),
-                )
+                report_focus = interpretation.report_focus or "full"
+                if report_focus == "full":
+                    report = await build_report(
+                        session,
+                        deps.rate_service,
+                        household,
+                        cycle,
+                        local_now.date(),
+                    )
+                else:
+                    report = await build_spending_answer(
+                        session,
+                        household,
+                        cycle,
+                        local_now.date(),
+                        interpretation.report_period or "current_cycle",
+                        report_focus,
+                    )
                 await session.commit()
             await message.reply(report, reply_markup=main_menu_keyboard())
             return
@@ -1187,12 +1198,16 @@ async def handle_natural_operation(
                         item.amount is None
                         or item.currency is None
                         or item.category_key not in category_by_key
-                        or not item.description
                     ):
-                        raise ValueError(
-                            "не хватает товара, суммы, валюты или категории"
-                        )
+                        raise ValueError("не хватает суммы, валюты или категории")
                     category = category_by_key[item.category_key]
+                    description = (item.description or "").strip()
+                    if not description:
+                        description = (
+                            f"Покупка в {interpretation.merchant}"
+                            if interpretation.merchant
+                            else category.name
+                        )
                     posted = await post_expense(
                         session,
                         deps.rate_service,
@@ -1201,7 +1216,7 @@ async def handle_natural_operation(
                         category,
                         Decimal(str(item.amount)),
                         normalize_currency(item.currency),
-                        item.description,
+                        description,
                         local_now,
                         user_id,
                         source_event_key=source_event_key,

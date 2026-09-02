@@ -190,6 +190,144 @@ async def test_natural_report_request_returns_full_report(monkeypatch) -> None:
     await engine.dispose()
 
 
+async def test_conversational_largest_spend_question_returns_short_answer(
+    monkeypatch,
+) -> None:
+    engine, factory, household, settings = await make_budget()
+    local_date = datetime.now(settings.timezone).date()
+    occurred_at = datetime.now(UTC)
+    async with factory() as session, session.begin():
+        cycle = await get_current_cycle(
+            session,
+            household,
+            local_date,
+            settings.financial_cycle_start_day,
+        )
+        seven_eleven = await session.scalar(
+            select(Category).where(
+                Category.household_id == household.id,
+                Category.key == "seven_eleven",
+            )
+        )
+        assert seven_eleven is not None
+        session.add(
+            ExchangeRate(
+                rate_date=local_date,
+                currency="THB",
+                nominal=Decimal("1"),
+                rate_kzt=Decimal("14"),
+                provider="NBK",
+            )
+        )
+        await session.flush()
+        session.add(
+            LedgerEntry(
+                household_id=household.id,
+                cycle_id=cycle.id,
+                category_id=seven_eleven.id,
+                entry_type="expense",
+                description="Покупка в 7-Eleven",
+                original_amount=Decimal("240"),
+                original_currency="THB",
+                amount_kzt=Decimal("3360"),
+                envelope_amount=Decimal("240"),
+                envelope_currency="THB",
+                occurred_at=occurred_at,
+                created_by_user_id=42,
+            )
+        )
+
+    interpreter = FakeInterpreter(
+        ExpenseInterpretation(
+            kind="report",
+            report_period="today",
+            report_focus="largest_category",
+            items=[],
+            overall_confidence=0.99,
+        )
+    )
+    full_report_builder = AsyncMock(return_value="Полный семейный отчёт")
+    monkeypatch.setattr("family_bot.telegram.handlers.build_report", full_report_builder)
+    deps = SimpleNamespace(
+        settings=settings,
+        session_factory=factory,
+        rate_service=RateService(),
+        expense_interpreter=interpreter,
+    )
+    message = FakeMessage(message_id=51)
+
+    await handle_natural_operation(
+        message,
+        deps,
+        household,
+        42,
+        "бро, расскажи, на что я сегодня потратил большую часть денег",
+    )
+
+    assert len(message.replies) == 1
+    assert "больше всего ушло" in message.replies[0]
+    assert "7-Eleven" in message.replies[0]
+    assert "240 THB" in message.replies[0]
+    assert "Полный семейный отчёт" not in message.replies[0]
+    full_report_builder.assert_not_awaited()
+    await engine.dispose()
+
+
+async def test_terse_seven_eleven_expense_without_description_is_posted() -> None:
+    engine, factory, household, settings = await make_budget()
+    local_date = datetime.now(settings.timezone).date()
+    async with factory() as session, session.begin():
+        session.add(
+            ExchangeRate(
+                rate_date=local_date,
+                currency="THB",
+                nominal=Decimal("1"),
+                rate_kzt=Decimal("14"),
+                provider="NBK",
+            )
+        )
+
+    interpreter = FakeInterpreter(
+        ExpenseInterpretation(
+            kind="expense",
+            merchant="7-Eleven",
+            items=[
+                InterpretedExpenseItem(
+                    amount=240,
+                    currency="THB",
+                    category_key="seven_eleven",
+                    confidence=0.99,
+                )
+            ],
+            overall_confidence=0.99,
+        )
+    )
+    deps = SimpleNamespace(
+        settings=settings,
+        session_factory=factory,
+        rate_service=RateService(),
+        expense_interpreter=interpreter,
+    )
+    message = FakeMessage(message_id=52)
+
+    await handle_natural_operation(message, deps, household, 42, "240 бат 7/11")
+
+    assert len(message.replies) == 1
+    assert "Расход записан" in message.replies[0]
+    assert "Покупка в 7-Eleven" in message.replies[0]
+    assert "240 THB" in message.replies[0]
+    async with factory() as session:
+        entry = await session.scalar(
+            select(LedgerEntry).where(
+                LedgerEntry.source_event_key == "message:-100777:52"
+            )
+        )
+        assert entry is not None
+        assert entry.description == "Покупка в 7-Eleven"
+        assert entry.category_id is not None
+    await engine.dispose()
+
+
 async def test_ai_creates_dynamic_goal_with_target_and_contribution() -> None:
     engine, factory, household, settings = await make_budget()
     interpreter = FakeInterpreter(

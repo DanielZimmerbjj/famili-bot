@@ -76,4 +76,6 @@ async def test_daily_report_shows_category_and_goal_remaining_amounts() -> None:
     assert "осталось 9 900 ฿" in report
     assert "Ноутбук" in report
     assert "осталось 700 000 KZT" in report
+    assert "Чеков сегодня: 0" in report
+    assert "На проверке" not in report
     await engine.dispose()

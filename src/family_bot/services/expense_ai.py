@@ -50,6 +50,14 @@ class ExpenseInterpretation(BaseModel):
     merchant: str | None = None
     receipt_total: float | None = Field(default=None, gt=0)
     receipt_currency: str | None = None
+    report_period: Literal["today", "current_cycle"] | None = None
+    report_focus: Literal[
+        "full",
+        "summary",
+        "largest_category",
+        "category_breakdown",
+        "recent_expenses",
+    ] | None = None
     items: list[InterpretedExpenseItem]
     overall_confidence: float = Field(ge=0, le=1)
 
@@ -160,9 +168,12 @@ Rules:
   "нет", "на самом деле", "исправь", "вместо" or "ошибка".
 - kind=other for a non-financial message, a question with no operation, or when the amount
   cannot be determined. Never turn an ordinary conversation into a financial operation.
-- For a new expense, every item needs description, positive amount, ISO 4217 currency,
-  category_key and confidence. If currency is omitted in an ordinary Thailand purchase,
-  use {self.default_currency}.
+- For a new expense, every item needs a positive amount, ISO 4217 currency, category_key
+  and confidence. Description may be null only for a terse but otherwise complete purchase;
+  the application will use the merchant or category as its description. If currency is
+  omitted in an ordinary Thailand purchase, use {self.default_currency}.
+- Terse entries are still valid expenses. For example, "240 бат 7/11" means one expense:
+  merchant="7-Eleven", amount=240, currency="THB", category_key="seven_eleven".
 - For income, every item needs description, positive amount, ISO 4217 currency and confidence.
   Salary without an explicit currency is KZT for this household.
 - For an existing savings goal, return its goal_key. For a new goal such as a laptop,
@@ -177,8 +188,14 @@ Rules:
   in target_amount and target_currency. Leave either replacement field null when unchanged.
   A phrase such as "измени цель MacBook M5 на MacBook M6, теперь он стоит миллион" is
   goal_update even though it contains words such as "измени" or "вместо".
-- For report, return an empty items list. Requests such as "скинь отчет", "покажи бюджет",
-  "сколько денег осталось" and "как у нас дела с накоплениями" are reports, not other.
+- For report, return an empty items list and set report_period plus report_focus.
+  Use current_cycle/full for an explicit full report such as "скинь отчет" or "покажи бюджет".
+  Use today/summary for "сколько сегодня потратил", today/largest_category for
+  "на что сегодня потратил больше всего", today/category_breakdown for
+  "на что сегодня тратил", and recent_expenses for a request to list recent purchases.
+  Conversational wording such as "бро, расскажи" does not make a finance question other.
+  Requests such as "сколько денег осталось" and "как у нас дела с накоплениями" use
+  current_cycle/full.
 - For a correction, return only values that change; null means keep the previous value.
   Do not use correction for editing a savings goal; use goal_update.
 - A receipt correction does not need confirmation first: it edits the already-posted
