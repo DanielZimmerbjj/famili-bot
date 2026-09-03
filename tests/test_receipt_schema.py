@@ -60,6 +60,40 @@ def test_receipt_schema_preserves_decimal_strings_exactly() -> None:
     assert extraction.items[0].name_ru == "Молоко"
 
 
+def test_receipt_schema_accepts_grouped_decimal_strings() -> None:
+    extraction = ReceiptExtraction.model_validate(
+        {
+            "document_type": "receipt",
+            "merchant": "Big C",
+            "purchased_at": None,
+            "currency": "THB",
+            "subtotal": "4,345.25",
+            "discount": "0",
+            "tax": "0",
+            "total": "4,345.25",
+            "items": [
+                {
+                    "raw_name": "Groceries",
+                    "name_ru": "Продукты",
+                    "quantity": "1",
+                    "unit_price": "4 345,25",
+                    "line_total": "4,345.25",
+                    "category_key": "groceries_household",
+                    "subcategory_key": None,
+                    "confidence": 0.99,
+                }
+            ],
+            "warnings": [],
+            "overall_confidence": 0.99,
+        }
+    )
+
+    assert extraction.total == Decimal("4345.25")
+    assert extraction.subtotal == Decimal("4345.25")
+    assert extraction.items[0].unit_price == Decimal("4345.25")
+    assert extraction.items[0].line_total == Decimal("4345.25")
+
+
 def test_receipt_schema_accepts_free_or_fully_discounted_item() -> None:
     extraction = ReceiptExtraction.model_validate(
         {

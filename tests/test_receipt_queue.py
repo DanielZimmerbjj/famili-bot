@@ -9,7 +9,11 @@ from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 from family_bot.config import Settings
 from family_bot.models import Base, Category, Receipt, ReceiptImage, ReceiptItem
 from family_bot.services.cycles import get_current_cycle, seed_default_household
-from family_bot.services.receipts import ReceiptService, ReceiptWorker
+from family_bot.services.receipts import (
+    ReceiptService,
+    ReceiptWorker,
+    receipt_progress_text,
+)
 
 
 async def queue_context():
@@ -73,6 +77,70 @@ async def test_album_pages_are_added_without_being_reported_as_duplicates() -> N
         assert second.outcome == "page_added"
         assert duplicate.outcome == "already_queued"
     await engine.dispose()
+
+
+async def test_receipt_keeps_message_used_for_progress_updates() -> None:
+    engine, factory, settings = await queue_context()
+    async with factory() as session, session.begin():
+        household = await seed_default_household(session, settings)
+        assert household is not None
+        cycle = await get_current_cycle(session, household, date(2026, 8, 29), 5)
+        result = await ReceiptService(settings).enqueue(
+            session=session,
+            household=household,
+            cycle_id=cycle.id,
+            chat_id=-100123,
+            message_id=10,
+            user_id=42,
+            file_id="file-1",
+            file_unique_id="unique-1",
+            mime_type="image/jpeg",
+            media_group_id=None,
+            progress_message_id=777,
+        )
+
+        assert result.receipt.progress_message_id == 777
+    await engine.dispose()
+
+
+async def test_worker_edits_receipt_progress_without_breaking_on_telegram_error() -> None:
+    engine, factory, settings = await queue_context()
+    bot = AsyncMock()
+    worker = ReceiptWorker(settings, factory, bot, object(), object())  # type: ignore[arg-type]
+    receipt = Receipt(
+        household_id="household",
+        cycle_id="cycle",
+        telegram_chat_id=-100123,
+        telegram_message_id=10,
+        progress_message_id=777,
+        created_by_user_id=42,
+    )
+
+    await worker._update_progress(receipt, 55, "распознаю чек")
+
+    bot.edit_message_text.assert_awaited_once_with(
+        chat_id=-100123,
+        message_id=777,
+        text="⏳ [█████░░░░░] 55% · распознаю чек",
+    )
+    bot.edit_message_text.side_effect = RuntimeError("telegram unavailable")
+    await worker._update_progress(receipt, 80, "проверяю суммы")
+    await engine.dispose()
+
+
+def test_receipt_progress_text_has_clear_terminal_states() -> None:
+    assert receipt_progress_text(10, "чек принят") == (
+        "⏳ [█░░░░░░░░░] 10% · чек принят"
+    )
+    assert receipt_progress_text(100, "чек обработан", done=True).startswith(
+        "✅ [██████████] 100%"
+    )
+    assert receipt_progress_text(100, "обработка не удалась", done=True).startswith(
+        "❌ [██████████] 100%"
+    )
+    assert receipt_progress_text(100, "запрос не обработан", done=True).startswith(
+        "❌ [██████████] 100%"
+    )
 
 
 async def test_resending_failed_receipt_requeues_it_and_updates_reply_target() -> None:

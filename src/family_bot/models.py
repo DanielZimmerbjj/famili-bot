@@ -170,6 +170,7 @@ class Receipt(Base, TimestampMixin):
     cycle_id: Mapped[str] = mapped_column(ForeignKey("budget_cycles.id", ondelete="CASCADE"))
     telegram_chat_id: Mapped[int] = mapped_column(BigInteger)
     telegram_message_id: Mapped[int] = mapped_column(BigInteger)
+    progress_message_id: Mapped[int | None] = mapped_column(BigInteger, nullable=True)
     telegram_media_group_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_by_user_id: Mapped[int] = mapped_column(BigInteger)
     status: Mapped[str] = mapped_column(String(32), default="received")

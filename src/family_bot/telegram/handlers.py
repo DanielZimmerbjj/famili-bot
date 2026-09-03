@@ -61,6 +61,7 @@ from family_bot.services.receipts import (
     ReceiptService,
     format_money,
     is_seven_eleven_merchant,
+    receipt_progress_text,
 )
 from family_bot.services.reports import build_chart, build_report, build_spending_answer
 from family_bot.services.text_parser import match_category
@@ -249,24 +250,55 @@ def build_router(deps: TelegramDependencies) -> Router:
                 f"{deps.settings.telegram_voice_max_seconds} секунд."
             )
             return
-        progress = await message.reply("🎙 Голосовое принял, расшифровываю…")
+        progress = await message.reply(
+            receipt_progress_text(15, "голосовое принял, загружаю")
+        )
         try:
             stream = BytesIO()
             await message.bot.download(message.voice.file_id, destination=stream)
+            await progress.edit_text(receipt_progress_text(40, "расшифровываю голос"))
             transcript = await deps.expense_interpreter.transcribe(
                 stream.getvalue(),
                 filename="voice.ogg",
                 mime_type=message.voice.mime_type or "audio/ogg",
             )
-            await progress.edit_text(f"📝 Распознал: <i>{escape(transcript)}</i>")
+            await progress.edit_text(
+                receipt_progress_text(75, "распознал, разбираю запрос")
+                + f"\n📝 <i>{escape(transcript)}</i>"
+            )
             if CLOSE_COMMAND_RE.fullmatch(transcript.strip()):
                 if user_id != deps.settings.telegram_owner_user_id:
+                    await progress.edit_text(
+                        receipt_progress_text(
+                            100,
+                            "запрос распознан, но нет прав на закрытие месяца",
+                            done=True,
+                        )
+                    )
                     await message.reply("Закрыть месяц может только владелец.")
                     return
                 await prompt_cycle_close(message, deps, household)
+                await progress.edit_text(
+                    receipt_progress_text(100, "голосовой запрос обработан", done=True)
+                    + f"\n📝 <i>{escape(transcript)}</i>"
+                )
                 return
             await handle_natural_operation(message, deps, household, user_id, transcript)
+            await progress.edit_text(
+                receipt_progress_text(100, "голосовой запрос обработан", done=True)
+                + f"\n📝 <i>{escape(transcript)}</i>"
+            )
         except Exception as exc:
+            try:
+                await progress.edit_text(
+                    receipt_progress_text(
+                        100,
+                        "голосовой запрос не обработан",
+                        done=True,
+                    )
+                )
+            except Exception:
+                logger.warning("Could not update voice progress", exc_info=True)
             await message.reply(f"❌ Не удалось обработать голосовое: {escape(str(exc))}")
 
     @router.message(F.photo | F.document)
@@ -293,7 +325,7 @@ def build_router(deps: TelegramDependencies) -> Router:
             await message.reply("Пришлите чек фотографией или изображением-файлом.")
             return
 
-        progress = await message.reply("📥 Фото чека получил, ставлю в обработку…")
+        progress = await message.reply(receipt_progress_text(10, "фото чека получил"))
         try:
             local_now = datetime.now(deps.settings.timezone)
             async with deps.session_factory() as session, session.begin():
@@ -314,16 +346,17 @@ def build_router(deps: TelegramDependencies) -> Router:
                     file_unique_id=file_unique_id,
                     mime_type=mime_type,
                     media_group_id=message.media_group_id,
+                    progress_message_id=progress.message_id,
                 )
             if result.outcome == "created":
-                response = f"⏳ Чек принят, разбираю · <code>{result.receipt.id[:8]}</code>"
+                response = receipt_progress_text(25, "чек сохранён, ждёт распознавания")
+                response += f" · <code>{result.receipt.id[:8]}</code>"
             elif result.outcome == "page_added":
-                response = f"📄 Страница чека добавлена · <code>{result.receipt.id[:8]}</code>"
+                response = receipt_progress_text(25, "страница добавлена, жду остальные")
+                response += f" · <code>{result.receipt.id[:8]}</code>"
             elif result.outcome == "requeued":
-                response = (
-                    "🔄 Прошлая обработка этого чека не завершилась. "
-                    f"Запускаю заново · <code>{result.receipt.id[:8]}</code>"
-                )
+                response = receipt_progress_text(25, "повторно запустил распознавание")
+                response += f" · <code>{result.receipt.id[:8]}</code>"
             elif result.outcome == "already_posted":
                 response = "ℹ️ Этот чек уже учтён. Повторно расход не списываю."
             else:

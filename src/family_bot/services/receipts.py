@@ -114,6 +114,7 @@ class ReceiptService:
         file_unique_id: str,
         mime_type: str,
         media_group_id: str | None,
+        progress_message_id: int | None = None,
     ) -> ReceiptEnqueueResult:
         existing_image = await session.scalar(
             select(ReceiptImage).where(
@@ -130,6 +131,7 @@ class ReceiptService:
                 existing_receipt.cycle_id = cycle_id
                 existing_receipt.telegram_chat_id = chat_id
                 existing_receipt.telegram_message_id = message_id
+                existing_receipt.progress_message_id = progress_message_id
                 existing_receipt.created_by_user_id = user_id
                 existing_receipt.status = "retrying"
                 existing_receipt.retry_count = 0
@@ -170,6 +172,7 @@ class ReceiptService:
                 cycle_id=cycle_id,
                 telegram_chat_id=chat_id,
                 telegram_message_id=message_id,
+                progress_message_id=progress_message_id,
                 telegram_media_group_id=media_group_id,
                 created_by_user_id=user_id,
                 status="received",
@@ -317,14 +320,17 @@ class ReceiptWorker:
                 )
                 if receipt is None:
                     return
+                await self._update_progress(receipt, 35, "подготавливаю фото")
                 image_payloads = await self._download_images(session, receipt)
                 categories, category_models, subcategory_models = await self._categories(
                     session, receipt.household_id
                 )
                 aliases = await self._aliases(session, receipt.household_id, category_models)
+                await self._update_progress(receipt, 55, "распознаю чек")
                 extraction, model_name = await self.extractor.extract(
                     image_payloads, categories, aliases
                 )
+                await self._update_progress(receipt, 80, "проверяю суммы и категории")
                 await self._validate_and_post(
                     session,
                     receipt,
@@ -334,6 +340,7 @@ class ReceiptWorker:
                     subcategory_models,
                 )
                 await session.commit()
+                await self._update_progress(receipt, 95, "расход записан, готовлю итог")
         except ClosedCycleReceiptError as exc:
             await self._mark_review(
                 receipt_id,
@@ -655,11 +662,35 @@ class ReceiptWorker:
                 reply_to_message_id=receipt.telegram_message_id,
                 reply_markup=keyboard,
             )
+            await self._update_progress(receipt, 100, "чек обработан и учтён", done=True)
             receipt.confirmation_status = "sent"
             receipt.confirmation_sent_at = utcnow()
             receipt.confirmation_retry_count = 0
             receipt.error_message = None
             await session.commit()
+
+    async def _update_progress(
+        self,
+        receipt: Receipt,
+        percent: int,
+        label: str,
+        *,
+        done: bool = False,
+    ) -> None:
+        if receipt.progress_message_id is None:
+            return
+        try:
+            await self.bot.edit_message_text(
+                chat_id=receipt.telegram_chat_id,
+                message_id=receipt.progress_message_id,
+                text=receipt_progress_text(percent, label, done=done),
+            )
+        except Exception:
+            logger.warning(
+                "Could not update progress for receipt %s",
+                receipt.id,
+                exc_info=True,
+            )
 
     async def _schedule_confirmation_retry(self, receipt_id: str, message: str) -> None:
         async with self.session_factory() as session, session.begin():
@@ -689,6 +720,8 @@ class ReceiptWorker:
             chat_id = receipt.telegram_chat_id
             message_id = receipt.telegram_message_id
         try:
+            if receipt.progress_message_id is not None:
+                await self._update_progress(receipt, 100, "нужно уточнение", done=True)
             buttons = [
                 InlineKeyboardButton(
                     text="🔄 Повторить",
@@ -723,6 +756,7 @@ class ReceiptWorker:
         self, receipt_id: str, message: str, *, force_terminal: bool = False
     ) -> None:
         should_notify = False
+        retry_delay = 0
         chat_id = 0
         message_id = 0
         async with self.session_factory() as session, session.begin():
@@ -739,8 +773,15 @@ class ReceiptWorker:
                 receipt.status = "failed"
                 should_notify = True
             else:
+                retry_delay = 2**receipt.retry_count * 10
                 receipt.status = "retrying"
-                receipt.next_attempt_at = utcnow() + timedelta(seconds=2**receipt.retry_count * 10)
+                receipt.next_attempt_at = utcnow() + timedelta(seconds=retry_delay)
+        if not should_notify:
+            await self._update_progress(
+                receipt,
+                55,
+                f"временная ошибка, повторяю через {retry_delay} с",
+            )
         if should_notify:
             keyboard = InlineKeyboardMarkup(
                 inline_keyboard=[
@@ -757,6 +798,8 @@ class ReceiptWorker:
                 ]
             )
             try:
+                if receipt.progress_message_id is not None:
+                    await self._update_progress(receipt, 100, "обработка не удалась", done=True)
                 await self.bot.send_message(
                     chat_id,
                     "❌ Не удалось обработать чек. Он сохранён и не списан. Бот продолжает работу.",
@@ -765,6 +808,24 @@ class ReceiptWorker:
                 )
             except Exception:
                 logger.exception("Could not notify Telegram about receipt %s failure", receipt_id)
+
+
+def receipt_progress_text(
+    percent: int,
+    label: str,
+    *,
+    done: bool = False,
+) -> str:
+    bounded = max(0, min(100, percent))
+    filled = 10 if bounded == 100 else bounded // 10
+    bar = "█" * filled + "░" * (10 - filled)
+    failed = any(marker in label for marker in ("не удалась", "не обработан"))
+    icon = "✅" if done and not failed else "⏳"
+    if "нужно уточнение" in label:
+        icon = "⚠️"
+    elif failed:
+        icon = "❌"
+    return f"{icon} [{bar}] {bounded}% · {label}"
 
 
 def format_money(value: Decimal | None) -> str:

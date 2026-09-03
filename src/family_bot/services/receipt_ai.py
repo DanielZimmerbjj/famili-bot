@@ -7,9 +7,30 @@ from decimal import Decimal
 from typing import Annotated
 
 from openai import APIConnectionError, APIStatusError, APITimeoutError, AsyncOpenAI
-from pydantic import BaseModel, ConfigDict, Field, WithJsonSchema, field_validator
+from pydantic import (
+    BaseModel,
+    BeforeValidator,
+    ConfigDict,
+    Field,
+    WithJsonSchema,
+    field_validator,
+)
 
 logger = logging.getLogger(__name__)
+
+
+def normalize_decimal_text(value: object) -> object:
+    if not isinstance(value, str):
+        return value
+    normalized = value.strip().replace(" ", "")
+    if "," not in normalized:
+        return normalized
+    if "." in normalized:
+        return normalized.replace(",", "")
+    whole, separator, fraction = normalized.rpartition(",")
+    if separator and 0 < len(fraction) <= 2:
+        return f"{whole}.{fraction}"
+    return normalized.replace(",", "")
 
 # Pydantic's default JSON schema for Decimal contains a negative-lookahead regex.
 # OpenAI Structured Outputs deliberately supports only a safe regex subset, so that
@@ -17,11 +38,13 @@ logger = logging.getLogger(__name__)
 # in the wire schema and let Pydantic validate and convert them back to Decimal exactly.
 PositiveDecimal = Annotated[
     Decimal,
+    BeforeValidator(normalize_decimal_text),
     Field(gt=0),
     WithJsonSchema({"type": "string"}),
 ]
 NonNegativeDecimal = Annotated[
     Decimal,
+    BeforeValidator(normalize_decimal_text),
     Field(ge=0),
     WithJsonSchema({"type": "string"}),
 ]
