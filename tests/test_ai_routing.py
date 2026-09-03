@@ -1,4 +1,4 @@
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -270,6 +270,79 @@ async def test_conversational_largest_spend_question_returns_short_answer(
     assert "240 THB" in message.replies[0]
     assert "Полный семейный отчёт" not in message.replies[0]
     full_report_builder.assert_not_awaited()
+    await engine.dispose()
+
+
+async def test_conversational_yesterday_question_uses_yesterday_entries() -> None:
+    engine, factory, household, settings = await make_budget()
+    local_today = datetime.now(settings.timezone).date()
+    yesterday_local_noon = datetime.combine(
+        local_today - timedelta(days=1),
+        time(hour=12),
+        settings.timezone,
+    )
+    occurred_at = yesterday_local_noon.astimezone(UTC)
+    async with factory() as session, session.begin():
+        cycle = await get_current_cycle(
+            session,
+            household,
+            local_today,
+            settings.financial_cycle_start_day,
+        )
+        seven_eleven = await session.scalar(
+            select(Category).where(
+                Category.household_id == household.id,
+                Category.key == "seven_eleven",
+            )
+        )
+        assert seven_eleven is not None
+        session.add(
+            LedgerEntry(
+                household_id=household.id,
+                cycle_id=cycle.id,
+                category_id=seven_eleven.id,
+                entry_type="expense",
+                description="Вчерашняя покупка",
+                original_amount=Decimal("175"),
+                original_currency="THB",
+                amount_kzt=Decimal("2450"),
+                envelope_amount=Decimal("175"),
+                envelope_currency="THB",
+                occurred_at=occurred_at,
+                created_by_user_id=42,
+            )
+        )
+
+    interpreter = FakeInterpreter(
+        ExpenseInterpretation(
+            kind="report",
+            report_period="yesterday",
+            report_focus="summary",
+            items=[],
+            overall_confidence=0.99,
+        )
+    )
+    deps = SimpleNamespace(
+        settings=settings,
+        session_factory=factory,
+        rate_service=RateService(),
+        expense_interpreter=interpreter,
+    )
+    message = FakeMessage(message_id=53)
+
+    await handle_natural_operation(
+        message,
+        deps,
+        household,
+        42,
+        "бро, сколько я потратил вчера денег?",
+    )
+
+    assert len(message.replies) == 1
+    assert "Вчера потрачено" in message.replies[0]
+    assert "2 450 ₸" in message.replies[0]
+    assert "175 THB" in message.replies[0]
+    assert "Ничего не записал" not in message.replies[0]
     await engine.dispose()
 
 

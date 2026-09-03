@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, date, datetime, time
+from datetime import UTC, date, datetime, time, timedelta
 from decimal import Decimal
 from io import BytesIO
 from zoneinfo import ZoneInfo
@@ -221,11 +221,15 @@ async def build_spending_answer(
         LedgerEntry.status == "posted",
     ]
     period_label = "Сегодня"
-    if period == "today":
-        day_start_local = datetime.combine(local_date, time.min).replace(
+    if period in {"today", "yesterday"}:
+        report_date = local_date
+        if period == "yesterday":
+            report_date -= timedelta(days=1)
+            period_label = "Вчера"
+        day_start_local = datetime.combine(report_date, time.min).replace(
             tzinfo=ZoneInfo(household.timezone)
         )
-        day_end_local = datetime.combine(local_date, time.max).replace(
+        day_end_local = datetime.combine(report_date, time.max).replace(
             tzinfo=day_start_local.tzinfo
         )
         filters.extend(

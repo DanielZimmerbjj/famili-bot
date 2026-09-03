@@ -118,4 +118,19 @@ def test_interpreter_prompt_delegates_all_financial_kinds_to_ai() -> None:
     assert "today/largest_category" in prompt
     assert "report_period" in prompt
     assert "report_focus" in prompt
-    assert "Never turn an ordinary conversation into a financial operation" in prompt
+    assert "A question about already stored expenses" in prompt
+    assert "сколько я потратил вчера" in prompt
+    assert "always kind=report" in prompt
+    assert "Never turn an ordinary non-financial conversation into an operation" in prompt
+
+
+def test_interpretation_supports_yesterday_report_period() -> None:
+    result = ExpenseInterpretation(
+        kind="report",
+        report_period="yesterday",
+        report_focus="summary",
+        items=[],
+        overall_confidence=0.99,
+    )
+
+    assert result.report_period == "yesterday"

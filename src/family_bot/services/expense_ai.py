@@ -50,7 +50,7 @@ class ExpenseInterpretation(BaseModel):
     merchant: str | None = None
     receipt_total: float | None = Field(default=None, gt=0)
     receipt_currency: str | None = None
-    report_period: Literal["today", "current_cycle"] | None = None
+    report_period: Literal["today", "yesterday", "current_cycle"] | None = None
     report_focus: Literal[
         "full",
         "summary",
@@ -166,8 +166,10 @@ Rules:
   expenses, income, balances, category limits or savings progress. A report is read-only.
 - kind=correction only when the user clearly corrects the previous operation, for example
   "нет", "на самом деле", "исправь", "вместо" or "ошибка".
-- kind=other for a non-financial message, a question with no operation, or when the amount
-  cannot be determined. Never turn an ordinary conversation into a financial operation.
+- kind=other only for a non-financial message or for an attempted new operation whose
+  essential amount cannot be determined. A question about already stored expenses, income,
+  balances, categories, receipts or savings is always kind=report even though it does not
+  create an operation. Never turn an ordinary non-financial conversation into an operation.
 - For a new expense, every item needs a positive amount, ISO 4217 currency, category_key
   and confidence. Description may be null only for a terse but otherwise complete purchase;
   the application will use the merchant or category as its description. If currency is
@@ -193,9 +195,13 @@ Rules:
   Use today/summary for "сколько сегодня потратил", today/largest_category for
   "на что сегодня потратил больше всего", today/category_breakdown for
   "на что сегодня тратил", and recent_expenses for a request to list recent purchases.
+  Use yesterday with the same requested focus for phrases such as "сколько я потратил вчера"
+  or "на что вчера ушли деньги". The period word may appear anywhere in a colloquial sentence.
   Conversational wording such as "бро, расскажи" does not make a finance question other.
   Requests such as "сколько денег осталось" and "как у нас дела с накоплениями" use
   current_cycle/full.
+- Report questions are read-only and safe: when their period and focus are clear, classify
+  them confidently as report instead of rejecting them for having no transaction amount.
 - For a correction, return only values that change; null means keep the previous value.
   Do not use correction for editing a savings goal; use goal_update.
 - A receipt correction does not need confirmation first: it edits the already-posted
