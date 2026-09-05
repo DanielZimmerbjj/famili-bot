@@ -79,3 +79,30 @@ async def test_daily_report_shows_category_and_goal_remaining_amounts() -> None:
     assert "Чеков сегодня: 0" in report
     assert "На проверке" not in report
     await engine.dispose()
+
+
+async def test_daily_report_keeps_expired_open_cycle_explicitly_open() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+    settings = Settings(
+        database_url="sqlite+aiosqlite:///:memory:",
+        telegram_owner_user_id=42,
+        setup_mode=True,
+    )
+
+    async with factory() as session, session.begin():
+        household = await seed_household(session, settings, -100777, 42)
+        cycle = await get_current_cycle(session, household, date(2026, 8, 29), 5)
+        report = await build_report(
+            session,
+            FixedRates(),
+            household,
+            cycle,
+            date(2026, 9, 5),
+        )
+
+    assert "Месяц всё ещё открыт" in report
+    assert "Финансовый месяц завершён" not in report
+    await engine.dispose()
