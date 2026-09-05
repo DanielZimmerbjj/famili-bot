@@ -19,6 +19,7 @@ RUN --mount=type=cache,target=/root/.cache/pip \
 COPY README.md alembic.ini ./
 COPY alembic ./alembic
 COPY src ./src
+COPY --chmod=755 docker/curl-healthcheck.py /usr/local/bin/curl
 
 RUN --mount=type=cache,target=/root/.cache/pip pip install --no-deps .
 
