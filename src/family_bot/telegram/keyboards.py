@@ -12,6 +12,7 @@ def main_menu_keyboard() -> ReplyKeyboardMarkup:
             [KeyboardButton(text="💰 Баланс"), KeyboardButton(text="🧾 Сегодня")],
             [KeyboardButton(text="🎯 Накопления"), KeyboardButton(text="📊 График")],
             [KeyboardButton(text="💵 Доходы"), KeyboardButton(text="❓ Помощь")],
+            [KeyboardButton(text="🔒 Закрыть месяц")],
         ],
         resize_keyboard=True,
         is_persistent=True,
@@ -53,6 +54,14 @@ def cycle_close_keyboard(
             InlineKeyboardButton(
                 text=keep_label,
                 callback_data=f"cycle:keep:{cycle_token}",
+            )
+        ]
+    )
+    rows.append(
+        [
+            InlineKeyboardButton(
+                text="↩️ Не закрывать",
+                callback_data=f"cycle:cancel:{cycle_token}",
             )
         ]
     )

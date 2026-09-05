@@ -66,6 +66,21 @@ async def get_current_cycle(
     on_date: date,
     start_day: int,
 ) -> BudgetCycle:
+    # A financial cycle is advanced only by the owner's explicit close action.
+    # Keeping the oldest eligible cycle open prevents reports and new entries
+    # from silently jumping to a fresh calendar period on the start day.
+    open_cycle = await session.scalar(
+        select(BudgetCycle)
+        .where(
+            BudgetCycle.household_id == household.id,
+            BudgetCycle.status == "open",
+            BudgetCycle.start_date <= on_date,
+        )
+        .order_by(BudgetCycle.start_date)
+    )
+    if open_cycle is not None:
+        return open_cycle
+
     start, end = cycle_dates(on_date, start_day)
     cycle = await session.scalar(
         select(BudgetCycle).where(
@@ -74,6 +89,8 @@ async def get_current_cycle(
         )
     )
     if cycle is not None:
+        if cycle.status == "pending":
+            cycle.status = "open"
         return cycle
 
     cycle = BudgetCycle(

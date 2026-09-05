@@ -130,6 +130,7 @@ CLOSE_COMMAND_RE = simple_command_pattern(
     plain=(
         "закрыть",
         "закрыть месяц",
+        "🔒 Закрыть месяц",
         "закрой месяц",
         "завершить месяц",
         "заверши месяц",
@@ -700,6 +701,13 @@ def build_router(deps: TelegramDependencies) -> Router:
             return
         parts = callback.data.split(":")
         action = parts[1] if len(parts) >= 2 else ""
+        if action == "cancel" and len(parts) == 3:
+            await callback.answer("Месяц оставлен открытым")
+            await callback.message.edit_reply_markup(reply_markup=None)
+            await callback.message.reply(
+                "↩️ Месяц не закрыт. Все операции и остатки продолжают учитываться."
+            )
+            return
         if action == "goal" and len(parts) == 4:
             cycle_reference, goal_reference = parts[2], parts[3]
         elif action in {"rollover", "keep"} and len(parts) == 3:
@@ -1095,7 +1103,8 @@ async def prompt_cycle_close(
             "Месяц можно закрыть без пополнения целей."
         )
     await message.reply(
-        text,
+        "🔒 <b>Месяц пока открыт.</b> Он закроется только после вашего "
+        "подтверждения ниже.\n\n" + text,
         reply_markup=cycle_close_keyboard(
             cycle.id,
             goal_options,

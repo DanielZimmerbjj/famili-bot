@@ -13,7 +13,7 @@ from family_bot.telegram.handlers import (
     SETUP_COMMAND_RE,
     authorize_message,
 )
-from family_bot.telegram.keyboards import cycle_close_keyboard
+from family_bot.telegram.keyboards import cycle_close_keyboard, main_menu_keyboard
 
 
 class FakeMessage:
@@ -74,10 +74,24 @@ def test_close_month_keyboard_lists_every_goal_with_short_callbacks() -> None:
         "🚙 Переложить всё в «Автомобиль»",
         "🎯 Переложить всё в «MacBook»",
         "🧰 Оставить остаток резервом",
+        "↩️ Не закрывать",
     ]
     assert all(
         len(row[0].callback_data or "") <= 64 for row in keyboard.inline_keyboard
     )
+
+
+def test_main_menu_exposes_manual_month_close_button() -> None:
+    keyboard = main_menu_keyboard()
+    assert [button.text for row in keyboard.keyboard for button in row] == [
+        "💰 Баланс",
+        "🧾 Сегодня",
+        "🎯 Накопления",
+        "📊 График",
+        "💵 Доходы",
+        "❓ Помощь",
+        "🔒 Закрыть месяц",
+    ]
 
 
 async def test_owner_first_group_message_automatically_seeds_budget() -> None:
