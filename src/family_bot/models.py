@@ -17,6 +17,7 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -103,7 +104,16 @@ class Subcategory(Base, TimestampMixin):
 
 class BudgetCycle(Base, TimestampMixin):
     __tablename__ = "budget_cycles"
-    __table_args__ = (UniqueConstraint("household_id", "start_date"),)
+    __table_args__ = (
+        UniqueConstraint("household_id", "start_date"),
+        Index(
+            "uq_budget_cycles_one_open_per_household",
+            "household_id",
+            unique=True,
+            postgresql_where=text("status = 'open'"),
+            sqlite_where=text("status = 'open'"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     household_id: Mapped[str] = mapped_column(ForeignKey("households.id", ondelete="CASCADE"))

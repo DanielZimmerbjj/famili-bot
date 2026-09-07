@@ -1,6 +1,8 @@
 from datetime import date
 
+import pytest
 from sqlalchemy import func, select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from family_bot.models import Base, BudgetCycle, Household
@@ -85,5 +87,61 @@ async def test_pending_calendar_cycle_activates_only_after_open_cycle_closes() -
         activated = await get_current_cycle(session, household, date(2026, 9, 5), 5)
         assert activated.id == september.id
         assert activated.status == "open"
+
+    await engine.dispose()
+
+
+async def test_old_operation_date_stays_in_manually_open_cycle() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with factory() as session, session.begin():
+        household = Household(name="Family")
+        session.add(household)
+        await session.flush()
+        august = await get_current_cycle(session, household, date(2026, 8, 29), 5)
+
+        # A receipt can contain an older printed date. Until the owner closes
+        # August, that date must not create a second open July cycle.
+        old_dated_operation = await get_current_cycle(
+            session, household, date(2026, 8, 3), 5
+        )
+
+        assert old_dated_operation.id == august.id
+        assert await session.scalar(select(func.count(BudgetCycle.id))) == 1
+
+    await engine.dispose()
+
+
+async def test_database_rejects_two_open_cycles_for_one_household() -> None:
+    engine = create_async_engine("sqlite+aiosqlite:///:memory:")
+    async with engine.begin() as connection:
+        await connection.run_sync(Base.metadata.create_all)
+    factory = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with factory() as session:
+        household = Household(name="Family")
+        session.add(household)
+        await session.flush()
+        session.add_all(
+            [
+                BudgetCycle(
+                    household_id=household.id,
+                    start_date=date(2026, 7, 5),
+                    end_date=date(2026, 8, 4),
+                    status="open",
+                ),
+                BudgetCycle(
+                    household_id=household.id,
+                    start_date=date(2026, 8, 5),
+                    end_date=date(2026, 9, 4),
+                    status="open",
+                ),
+            ]
+        )
+        with pytest.raises(IntegrityError):
+            await session.flush()
 
     await engine.dispose()

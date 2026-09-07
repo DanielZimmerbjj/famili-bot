@@ -67,16 +67,19 @@ async def get_current_cycle(
     start_day: int,
 ) -> BudgetCycle:
     # A financial cycle is advanced only by the owner's explicit close action.
-    # Keeping the oldest eligible cycle open prevents reports and new entries
-    # from silently jumping to a fresh calendar period on the start day.
+    # While it remains open, every new operation belongs to it even when the
+    # operation carries an older date. This also prevents an OCR date from
+    # silently creating another historical open cycle.
     open_cycle = await session.scalar(
         select(BudgetCycle)
         .where(
             BudgetCycle.household_id == household.id,
             BudgetCycle.status == "open",
-            BudgetCycle.start_date <= on_date,
         )
-        .order_by(BudgetCycle.start_date)
+        # A migration enforces one open cycle. Descending order is a safe
+        # fallback for databases that still contain a legacy duplicate.
+        .order_by(BudgetCycle.start_date.desc())
+        .limit(1)
     )
     if open_cycle is not None:
         return open_cycle

@@ -484,10 +484,17 @@ class ReceiptWorker:
         if receipt.force_current_cycle:
             target_cycle = await session.get_one(BudgetCycle, receipt.cycle_id)
         else:
+            # The receipt's printed date controls its exchange rate, but never
+            # which budget envelope is active. Only the owner's explicit close
+            # action advances the financial month.
+            received_at = receipt.created_at
+            if received_at.tzinfo is None:
+                received_at = received_at.replace(tzinfo=UTC)
+            received_local_date = received_at.astimezone(self.settings.timezone).date()
             target_cycle = await get_current_cycle(
                 session,
                 household,
-                purchased_at.date(),
+                received_local_date,
                 self.settings.financial_cycle_start_day,
             )
             receipt.cycle_id = target_cycle.id
