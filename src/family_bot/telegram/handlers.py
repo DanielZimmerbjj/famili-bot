@@ -1198,7 +1198,14 @@ async def handle_natural_operation(
                     deps.settings.financial_cycle_start_day,
                 )
                 report_focus = interpretation.report_focus or "full"
-                if report_focus == "full":
+                report_category_key = interpretation.report_category_key
+                if report_category_key and report_category_key not in category_by_key:
+                    await message.reply(
+                        "Не нашёл такую статью расходов. Назовите категорию так, "
+                        "как она указана в бюджете."
+                    )
+                    return
+                if report_focus == "full" and not report_category_key:
                     report = await build_report(
                         session,
                         deps.rate_service,
@@ -1214,6 +1221,7 @@ async def handle_natural_operation(
                         local_now.date(),
                         interpretation.report_period or "current_cycle",
                         report_focus,
+                        report_category_key,
                     )
                 await session.commit()
             await message.reply(report, reply_markup=main_menu_keyboard())

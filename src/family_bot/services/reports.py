@@ -13,6 +13,7 @@ from sqlalchemy import desc, func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from family_bot.models import (
+    BudgetAllocation,
     BudgetCycle,
     Category,
     Household,
@@ -160,12 +161,9 @@ async def build_report(
             f"Доход получен: {format_money(income_received)} / "
             f"{format_money(cycle.expected_income_kzt)} ₸",
             f"Обязательства: {format_money(cycle.mandatory_kzt)} ₸",
-            f"Свободно сейчас: "
-            f"<b>{format_money(close_breakdown.transferable_kzt)} ₸</b>",
-            f"Плановый остаток на накопления: "
-            f"<b>{format_money(projected_car)} ₸</b>",
-            f"Ориентир на машину: {format_money(cycle.car_target_kzt)} ₸ "
-            "(не обязательный)",
+            f"Свободно сейчас: <b>{format_money(close_breakdown.transferable_kzt)} ₸</b>",
+            f"Плановый остаток на накопления: <b>{format_money(projected_car)} ₸</b>",
+            f"Ориентир на машину: {format_money(cycle.car_target_kzt)} ₸ (не обязательный)",
         ]
     )
 
@@ -213,6 +211,7 @@ async def build_spending_answer(
     local_date: date,
     period: str,
     focus: str,
+    category_key: str | None = None,
 ) -> str:
     """Build a short, exact answer to a conversational spending question."""
 
@@ -242,6 +241,8 @@ async def build_spending_answer(
     else:
         period_label = "В этом финансовом месяце"
         filters.append(LedgerEntry.cycle_id == cycle.id)
+    if category_key:
+        filters.append(Category.key == category_key)
 
     category_rows = (
         await session.execute(
@@ -265,6 +266,17 @@ async def build_spending_answer(
     ).all()
     total_kzt = sum((Decimal(row[4]) for row in category_rows), Decimal("0"))
     if not category_rows:
+        if category_key:
+            category = await session.scalar(
+                select(Category).where(
+                    Category.household_id == household.id,
+                    Category.key == category_key,
+                )
+            )
+            if category is not None:
+                return (
+                    f"{period_label} по статье {category.icon} <b>{category.name}</b> расходов нет."
+                )
         return f"{period_label} расходов пока нет."
 
     def category_amount(row: tuple[object, ...]) -> str:
@@ -272,9 +284,33 @@ async def build_spending_answer(
         envelope_currency = str(row[2])
         amount_kzt = Decimal(row[4])
         return (
-            f"{format_money(envelope_amount)} {envelope_currency} "
-            f"(≈ {format_money(amount_kzt)} ₸)"
+            f"{format_money(envelope_amount)} {envelope_currency} (≈ {format_money(amount_kzt)} ₸)"
         )
+
+    if category_key:
+        row = category_rows[0]
+        allocation = await session.scalar(
+            select(BudgetAllocation.amount)
+            .join(Category, Category.id == BudgetAllocation.category_id)
+            .where(
+                BudgetAllocation.cycle_id == cycle.id,
+                Category.household_id == household.id,
+                Category.key == category_key,
+            )
+        )
+        line = f"{period_label} на {row[1]} <b>{row[0]}</b> потрачено {category_amount(row)}."
+        if period == "current_cycle" and allocation is not None:
+            spent = Decimal(row[3])
+            limit = Decimal(allocation)
+            remaining = limit - spent
+            if remaining >= 0:
+                line += (
+                    f" Осталось <b>{format_money(remaining)} {row[2]}</b> "
+                    f"из {format_money(limit)} {row[2]}."
+                )
+            else:
+                line += f" Перерасход <b>{format_money(abs(remaining))} {row[2]}</b>."
+        return line
 
     if focus == "largest_category":
         largest = category_rows[0]
@@ -305,9 +341,7 @@ async def build_spending_answer(
 
     if focus == "category_breakdown":
         lines = [f"{period_label} расходы по категориям:"]
-        lines.extend(
-            f"• {row[1]} {row[0]} — {category_amount(row)}" for row in category_rows[:7]
-        )
+        lines.extend(f"• {row[1]} {row[0]} — {category_amount(row)}" for row in category_rows[:7])
         lines.append(f"Всего: <b>{format_money(total_kzt)} ₸</b>.")
         return "\n".join(lines)
 

@@ -58,9 +58,11 @@ class ExpenseInterpretation(BaseModel):
             "largest_category",
             "category_breakdown",
             "recent_expenses",
+            "category_status",
         ]
         | None
     ) = None
+    report_category_key: str | None = None
     target_entry_ref: str | None = None
     correction_scope: Literal["operation", "whole_receipt", "receipt_item"] | None = None
     assistant_reply: str | None = None
@@ -207,6 +209,10 @@ Rules:
   Conversational wording such as "бро, расскажи" does not make a finance question other.
   Requests such as "сколько денег осталось" and "как у нас дела с накоплениями" use
   current_cycle/full.
+- When the question names one allowed expense category, set report_category_key to its exact
+  key and report_focus=category_status. For example, "сколько я потратил на SIM-карты в этом
+  месяце" uses current_cycle/category_status with report_category_key=mobile. A specific
+  category question must never become a full report.
 - Report questions are read-only and safe: when their period and focus are clear, classify
   them confidently as report instead of rejecting them for having no transaction amount.
 - For a correction, return only values that change; null means keep the previous value.

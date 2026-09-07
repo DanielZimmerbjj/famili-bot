@@ -272,6 +272,74 @@ async def test_conversational_largest_spend_question_returns_short_answer(
     await engine.dispose()
 
 
+async def test_specific_category_question_returns_only_that_category() -> None:
+    engine, factory, household, settings = await make_budget()
+    local_date = datetime.now(settings.timezone).date()
+    async with factory() as session, session.begin():
+        cycle = await get_current_cycle(
+            session,
+            household,
+            local_date,
+            settings.financial_cycle_start_day,
+        )
+        mobile = await session.scalar(
+            select(Category).where(
+                Category.household_id == household.id,
+                Category.key == "mobile",
+            )
+        )
+        assert mobile is not None
+        session.add(
+            LedgerEntry(
+                household_id=household.id,
+                cycle_id=cycle.id,
+                category_id=mobile.id,
+                entry_type="expense",
+                description="Пополнение SIM-карты",
+                original_amount=Decimal("200"),
+                original_currency="THB",
+                amount_kzt=Decimal("2776"),
+                envelope_amount=Decimal("200"),
+                envelope_currency="THB",
+                occurred_at=datetime.now(UTC),
+                created_by_user_id=42,
+            )
+        )
+
+    interpreter = FakeInterpreter(
+        ExpenseInterpretation(
+            kind="report",
+            report_period="current_cycle",
+            report_focus="category_status",
+            report_category_key="mobile",
+            items=[],
+            overall_confidence=0.99,
+        )
+    )
+    deps = SimpleNamespace(
+        settings=settings,
+        session_factory=factory,
+        rate_service=RateService(),
+        expense_interpreter=interpreter,
+    )
+    message = FakeMessage(message_id=52)
+
+    await handle_natural_operation(
+        message,
+        deps,
+        household,
+        42,
+        "Сколько я потратил на сим-карты в этом месяце?",
+    )
+
+    assert len(message.replies) == 1
+    assert "SIM-карты" in message.replies[0]
+    assert "200 THB" in message.replies[0]
+    assert "осталось" in message.replies[0].lower()
+    assert "расходы по категориям" not in message.replies[0]
+    await engine.dispose()
+
+
 async def test_conversational_yesterday_question_uses_yesterday_entries() -> None:
     engine, factory, household, settings = await make_budget()
     local_today = datetime.now(settings.timezone).date()
