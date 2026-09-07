@@ -14,7 +14,7 @@ from pathlib import Path
 
 from aiogram import Bot
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
-from sqlalchemy import delete, func, select, update
+from sqlalchemy import delete, func, or_, select, update
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
@@ -862,16 +862,12 @@ def receipt_adjustment_lines(
     extraction: dict | None,
 ) -> list[str]:
     """Explain why printed item prices differ from the paid receipt total."""
-    printed_total = sum(
-        (Decimal(item.display_line_total) for item in items), Decimal("0")
-    )
+    printed_total = sum((Decimal(item.display_line_total) for item in items), Decimal("0"))
     discount = extraction_decimal(extraction, "discount")
     tax = extraction_decimal(extraction, "tax")
     lines: list[str] = []
     if discount > 0 or tax > 0 or printed_total != original_total:
-        lines.append(
-            f"Сумма товаров: <b>{format_money(printed_total)} {currency}</b>"
-        )
+        lines.append(f"Сумма товаров: <b>{format_money(printed_total)} {currency}</b>")
     if discount > 0:
         lines.append(f"Скидка по чеку: <b>−{format_money(discount)} {currency}</b>")
     if tax > 0:
@@ -933,14 +929,21 @@ async def backfill_seven_eleven_receipts(
     household: Household,
 ) -> int:
     """Move previously posted 7-Eleven receipts into the dedicated envelope."""
-    category = await session.scalar(
-        select(Category).where(
-            Category.household_id == household.id,
-            Category.key == SEVEN_ELEVEN_CATEGORY_KEY,
+    categories = (
+        await session.scalars(
+            select(Category).where(
+                Category.household_id == household.id,
+                Category.key.in_((SEVEN_ELEVEN_CATEGORY_KEY, "mobile")),
+            )
         )
-    )
+    ).all()
+    category_by_key = {category.key: category for category in categories}
+    category = category_by_key.get(SEVEN_ELEVEN_CATEGORY_KEY)
     if category is None:
         return 0
+    preserved_category_ids = {
+        preserved.id for key in ("mobile",) if (preserved := category_by_key.get(key)) is not None
+    }
 
     receipts = (
         await session.scalars(
@@ -950,9 +953,7 @@ async def backfill_seven_eleven_receipts(
             )
         )
     ).all()
-    receipt_ids = [
-        receipt.id for receipt in receipts if is_seven_eleven_merchant(receipt.merchant)
-    ]
+    receipt_ids = [receipt.id for receipt in receipts if is_seven_eleven_merchant(receipt.merchant)]
     if not receipt_ids:
         return 0
 
@@ -961,6 +962,10 @@ async def backfill_seven_eleven_receipts(
         .where(
             ReceiptItem.receipt_id.in_(receipt_ids),
             ReceiptItem.category_id.is_distinct_from(category.id),
+            or_(
+                ReceiptItem.category_id.is_(None),
+                ReceiptItem.category_id.not_in(preserved_category_ids),
+            ),
         )
         .values(category_id=category.id, subcategory_id=None)
     )
@@ -971,6 +976,10 @@ async def backfill_seven_eleven_receipts(
             LedgerEntry.status == "posted",
             LedgerEntry.entry_type == "expense",
             LedgerEntry.category_id.is_distinct_from(category.id),
+            or_(
+                LedgerEntry.category_id.is_(None),
+                LedgerEntry.category_id.not_in(preserved_category_ids),
+            ),
         )
         .values(category_id=category.id)
     )
@@ -984,7 +993,7 @@ def prepare_receipt_items(
     subcategories: dict[str, Subcategory],
     confidence_threshold: float,
 ) -> tuple[list[ExtractedItem], list[str]]:
-    """Route every paid 7-Eleven row to its dedicated envelope."""
+    """Use the store envelope unless a paid row has an explicit purpose override."""
     if not is_seven_eleven_merchant(merchant):
         return prepare_chargeable_items(
             items,
@@ -995,16 +1004,18 @@ def prepare_receipt_items(
     if SEVEN_ELEVEN_CATEGORY_KEY not in categories:
         raise ReceiptValidationError("Не настроена категория 7-Eleven")
 
-    prepared = [
-        item.model_copy(
-            update={
-                "category_key": SEVEN_ELEVEN_CATEGORY_KEY,
-                "subcategory_key": None,
-            }
+    prepared = []
+    for item in items:
+        if item.line_total <= 0:
+            continue
+        category_key = (
+            "mobile"
+            if item.category_key == "mobile" and "mobile" in categories
+            else SEVEN_ELEVEN_CATEGORY_KEY
         )
-        for item in items
-        if item.line_total > 0
-    ]
+        prepared.append(
+            item.model_copy(update={"category_key": category_key, "subcategory_key": None})
+        )
     if not prepared:
         raise ReceiptValidationError("В чеке не найдено оплаченных позиций")
     return prepared, []

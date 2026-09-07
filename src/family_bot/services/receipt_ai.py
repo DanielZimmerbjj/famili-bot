@@ -32,6 +32,7 @@ def normalize_decimal_text(value: object) -> object:
         return f"{whole}.{fraction}"
     return normalized.replace(",", "")
 
+
 # Pydantic's default JSON schema for Decimal contains a negative-lookahead regex.
 # OpenAI Structured Outputs deliberately supports only a safe regex subset, so that
 # schema is rejected before the model can inspect the receipt. Keep values as strings
@@ -135,9 +136,7 @@ class ReceiptExtractor:
                     self._describe_error(exc),
                 )
 
-        details = "; ".join(
-            f"{model}: {self._describe_error(error)}" for model, error in attempts
-        )
+        details = "; ".join(f"{model}: {self._describe_error(error)}" for model, error in attempts)
         raise ReceiptExtractionError(
             details or "OpenAI receipt extraction failed",
             retryable=any(self._is_retryable(error) for _, error in attempts),
@@ -231,6 +230,10 @@ Rules:
   describe the recognizable product type in Russian and add "(неразборчиво)".
 - category_key must be one of the keys below, or unknown.
 - subcategory_key must belong to its selected category, or be null.
+- A merchant is only the payment location, not automatically the purpose. Classify a phone
+  balance, prepaid mobile package or SIM-card top-up as mobile even when it was paid at
+  7-Eleven. Ordinary physical goods from 7-Eleven may use seven_eleven when no stronger
+  family-budget purpose is printed.
 - confidence reflects visual certainty, not plausibility.
 
 Allowed categories:

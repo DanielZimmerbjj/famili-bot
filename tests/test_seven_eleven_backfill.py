@@ -39,7 +39,14 @@ async def test_backfills_existing_seven_eleven_receipt_idempotently() -> None:
             envelope_currency="THB",
             default_limit=Decimal("3000"),
         )
-        session.add_all([groceries, seven_eleven])
+        mobile = Category(
+            household_id=household.id,
+            key="mobile",
+            name="SIM cards",
+            envelope_currency="THB",
+            default_limit=Decimal("400"),
+        )
+        session.add_all([groceries, seven_eleven, mobile])
         await session.flush()
         cycle = BudgetCycle(
             household_id=household.id,
@@ -65,6 +72,12 @@ async def test_backfills_existing_seven_eleven_receipt_idempotently() -> None:
             raw_name="Milk",
             line_total=Decimal("124"),
         )
+        mobile_item = ReceiptItem(
+            receipt_id=receipt.id,
+            category_id=mobile.id,
+            raw_name="SIM top-up",
+            line_total=Decimal("250"),
+        )
         entry = LedgerEntry(
             household_id=household.id,
             cycle_id=cycle.id,
@@ -78,13 +91,28 @@ async def test_backfills_existing_seven_eleven_receipt_idempotently() -> None:
             envelope_amount=Decimal("124"),
             envelope_currency="THB",
         )
-        session.add_all([item, entry])
+        mobile_entry = LedgerEntry(
+            household_id=household.id,
+            cycle_id=cycle.id,
+            category_id=mobile.id,
+            receipt_id=receipt.id,
+            entry_type="expense",
+            description="SIM top-up",
+            original_amount=Decimal("250"),
+            original_currency="THB",
+            amount_kzt=Decimal("3500"),
+            envelope_amount=Decimal("250"),
+            envelope_currency="THB",
+        )
+        session.add_all([item, mobile_item, entry, mobile_entry])
         await session.flush()
 
         assert await backfill_seven_eleven_receipts(session, household) == 1
         assert item.category_id == seven_eleven.id
         assert item.subcategory_id is None
         assert entry.category_id == seven_eleven.id
+        assert mobile_item.category_id == mobile.id
+        assert mobile_entry.category_id == mobile.id
         assert await backfill_seven_eleven_receipts(session, household) == 0
 
     await engine.dispose()

@@ -63,6 +63,26 @@ def test_interpreter_prompt_supports_receipt_merchant_total_and_named_item() -> 
     assert "does not need confirmation" in prompt
 
 
+def test_interpreter_prompt_treats_sim_topup_as_purpose_not_store() -> None:
+    interpreter = ExpenseInterpreter(
+        api_key="test",
+        intent_model="test-model",
+        fallback_model="test-model",
+        transcription_model="test-transcription",
+        default_currency="THB",
+    )
+    prompt = interpreter._prompt(
+        "почему записал в 7-Eleven? это пополнение SIM-карты",
+        {"seven_eleven": "7-Eleven", "mobile": "Две SIM-карты"},
+        "T1 | expense receipt | merchant=7-Eleven | total=252.50 THB",
+    )
+
+    assert "Explicit purpose always wins" in prompt
+    assert "SIM-card top-up is category mobile" in prompt
+    assert "target_entry_ref" in prompt
+    assert "whole_receipt" in prompt
+
+
 def test_interpretation_supports_income_and_savings() -> None:
     income = ExpenseInterpretation(
         kind="income",

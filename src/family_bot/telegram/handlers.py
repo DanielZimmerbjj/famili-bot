@@ -18,7 +18,6 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from sqlalchemy.orm import selectinload
 
 from family_bot.config import Settings
-from family_bot.constants import SEVEN_ELEVEN_CATEGORY_KEY
 from family_bot.models import (
     AuditLog,
     BudgetCycle,
@@ -60,7 +59,6 @@ from family_bot.services.receipt_images import infer_document_image_mime
 from family_bot.services.receipts import (
     ReceiptService,
     format_money,
-    is_seven_eleven_merchant,
     receipt_progress_text,
 )
 from family_bot.services.reports import build_chart, build_report, build_spending_answer
@@ -105,24 +103,16 @@ BALANCE_COMMAND_RE = simple_command_pattern(
     "отчет",
     plain=("остаток", "отчет", "💰 Баланс"),
 )
-TODAY_COMMAND_RE = simple_command_pattern(
-    "today", "сегодня", plain=("сегодня", "🧾 Сегодня")
-)
-INCOME_COMMAND_RE = simple_command_pattern(
-    "income", "доходы", plain=("доходы", "💵 Доходы")
-)
-CHART_COMMAND_RE = simple_command_pattern(
-    "chart", "график", plain=("график", "📊 График")
-)
+TODAY_COMMAND_RE = simple_command_pattern("today", "сегодня", plain=("сегодня", "🧾 Сегодня"))
+INCOME_COMMAND_RE = simple_command_pattern("income", "доходы", plain=("доходы", "💵 Доходы"))
+CHART_COMMAND_RE = simple_command_pattern("chart", "график", plain=("график", "📊 График"))
 GOAL_COMMAND_RE = simple_command_pattern(
     "goal",
     "goals",
     "цель",
     plain=("цель", "накопления", "🎯 Накопления"),
 )
-HELP_COMMAND_RE = simple_command_pattern(
-    "start", "help", "помощь", plain=("помощь", "❓ Помощь")
-)
+HELP_COMMAND_RE = simple_command_pattern("start", "help", "помощь", plain=("помощь", "❓ Помощь"))
 CLOSE_COMMAND_RE = simple_command_pattern(
     "close",
     "rollover",
@@ -158,6 +148,14 @@ class TelegramDependencies:
     rate_service: RateService
     receipt_service: ReceiptService
     expense_interpreter: ExpenseInterpreter
+
+
+@dataclass(frozen=True, slots=True)
+class FinancialConversationContext:
+    """Safe, human-readable references the model can use to select ledger records."""
+
+    prompt: str | None
+    entry_ids_by_ref: dict[str, str]
 
 
 def build_router(deps: TelegramDependencies) -> Router:
@@ -251,9 +249,7 @@ def build_router(deps: TelegramDependencies) -> Router:
                 f"{deps.settings.telegram_voice_max_seconds} секунд."
             )
             return
-        progress = await message.reply(
-            receipt_progress_text(15, "голосовое принял, загружаю")
-        )
+        progress = await message.reply(receipt_progress_text(15, "голосовое принял, загружаю"))
         try:
             stream = BytesIO()
             await message.bot.download(message.voice.file_id, destination=stream)
@@ -831,8 +827,7 @@ def build_router(deps: TelegramDependencies) -> Router:
             )
         else:
             await callback.message.reply(
-                "✅ Месяц закрыт. После обязательств и бордеррана "
-                "свободного остатка нет."
+                "✅ Месяц закрыт. После обязательств и бордеррана свободного остатка нет."
             )
 
     @router.callback_query(F.data.startswith("receipt:"))
@@ -999,9 +994,7 @@ async def resolve_open_cycle_reference(
         )
     ).all()
     matches = [
-        cycle
-        for cycle in cycles
-        if compact_callback_reference(cycle.id).startswith(normalized)
+        cycle for cycle in cycles if compact_callback_reference(cycle.id).startswith(normalized)
     ]
     return matches[0] if len(matches) == 1 else None
 
@@ -1058,8 +1051,7 @@ async def prompt_cycle_close(
                 await message.reply("Этот финансовый месяц уже закрыт.")
             else:
                 await message.reply(
-                    f"Закрыть текущий месяц можно "
-                    f"{current_cycle.end_date.strftime('%d.%m.%Y')}."
+                    f"Закрыть текущий месяц можно {current_cycle.end_date.strftime('%d.%m.%Y')}."
                 )
             return
         if not cycle_can_close(local_now, cycle, deps.settings):
@@ -1071,9 +1063,7 @@ async def prompt_cycle_close(
             return
         pending = await pending_receipt_count(session, cycle.id)
         if pending:
-            await message.reply(
-                f"Сначала разберите {pending} чек(а/ов), которые ещё не проведены."
-            )
+            await message.reply(f"Сначала разберите {pending} чек(а/ов), которые ещё не проведены.")
             return
         breakdown = await cycle_close_breakdown(session, cycle)
         amount = breakdown.transferable_kzt
@@ -1098,10 +1088,7 @@ async def prompt_cycle_close(
             "Куда переложить остаток?"
         )
     else:
-        text = (
-            "💰 Свободного остатка для переноса нет. "
-            "Месяц можно закрыть без пополнения целей."
-        )
+        text = "💰 Свободного остатка для переноса нет. Месяц можно закрыть без пополнения целей."
     await message.reply(
         "🔒 <b>Месяц пока открыт.</b> Он закроется только после вашего "
         "подтверждения ниже.\n\n" + text,
@@ -1151,20 +1138,18 @@ async def handle_natural_operation(
                     )
                 )
             ).all()
-            previous_context = await latest_expense_context(session, household.id)
+            financial_context = await recent_financial_context(session, household.id)
         categories = {category.key: category.name for category in category_models}
         category_by_key = {category.key: category for category in category_models}
         goals = {
-            goal.key: (
-                f"{goal.name}; target={format_money(goal.target_amount)} {goal.currency}"
-            )
+            goal.key: (f"{goal.name}; target={format_money(goal.target_amount)} {goal.currency}")
             for goal in goal_models
         }
         goal_by_key = {goal.key: goal for goal in goal_models}
         interpretation = await deps.expense_interpreter.interpret(
             text,
             categories,
-            previous_context=previous_context,
+            previous_context=financial_context.prompt,
             goals=goals,
         )
         if interpretation.overall_confidence < 0.55:
@@ -1174,7 +1159,18 @@ async def handle_natural_operation(
             )
             return
         if interpretation.kind == "correction":
-            await correct_last_expense(
+            target_ref = (interpretation.target_entry_ref or "T1").strip().upper()
+            target_entry_id = financial_context.entry_ids_by_ref.get(target_ref)
+            if interpretation.target_entry_ref and target_entry_id is None:
+                await message.reply(
+                    escape(
+                        interpretation.assistant_reply
+                        or "Не нашёл указанную операцию среди последних. "
+                        "Назовите сумму, магазин или время операции."
+                    )
+                )
+                return
+            await correct_financial_operation(
                 message,
                 deps,
                 household,
@@ -1182,12 +1178,16 @@ async def handle_natural_operation(
                 text,
                 interpretation=interpretation,
                 source_event_key=source_event_key,
+                target_entry_id=target_entry_id,
             )
             return
         if interpretation.kind == "other":
-            await message.reply(
-                "ℹ️ Нейросеть не нашла в сообщении финансовой операции. Ничего не записал."
+            reply = interpretation.assistant_reply or (
+                "Я не увидел здесь финансового действия. Ничего не записал. "
+                "Скажите свободной фразой, "
+                "что записать, исправить или показать."
             )
+            await message.reply(f"💬 {escape(reply)}")
             return
         if interpretation.kind == "report":
             async with deps.session_factory() as session:
@@ -1265,9 +1265,7 @@ async def handle_natural_operation(
                         source_item_index=item_index,
                     )
                     posted_expenses.append((posted, category))
-                response = await build_expense_response(
-                    session, cycle.id, posted_expenses
-                )
+                response = await build_expense_response(session, cycle.id, posted_expenses)
             elif interpretation.kind == "income":
                 lines = ["✅ <b>Доход записан</b>"]
                 for item_index, item in enumerate(interpretation.items):
@@ -1355,9 +1353,7 @@ async def handle_natural_operation(
                             )
                             changed = True
                         if not changed:
-                            raise ValueError(
-                                "не понял новое название или новую стоимость цели"
-                            )
+                            raise ValueError("не понял новое название или новую стоимость цели")
                         balance = await goal_balance(session, household.id, goal.id)
                         target = Decimal(goal.target_amount)
                         remaining = max(target - balance, Decimal("0"))
@@ -1440,8 +1436,7 @@ async def handle_natural_operation(
                         )
                     else:
                         progress = (
-                            f"накоплено {format_money(balance)} ₸ · "
-                            "напишите общую стоимость цели"
+                            f"накоплено {format_money(balance)} ₸ · напишите общую стоимость цели"
                         )
                     lines.append(
                         f"• {goal.icon} {escape(goal.name)}: "
@@ -1583,52 +1578,88 @@ async def update_goal_target(
     goal.currency = "KZT"
 
 
-async def latest_expense_context(
+async def recent_financial_context(
     session: AsyncSession,
     household_id: str,
-) -> str | None:
-    entry = await session.scalar(
-        select(LedgerEntry)
-        .where(
-            LedgerEntry.household_id == household_id,
-            LedgerEntry.entry_type == "expense",
-            LedgerEntry.status == "posted",
+) -> FinancialConversationContext:
+    entries = (
+        await session.scalars(
+            select(LedgerEntry)
+            .where(
+                LedgerEntry.household_id == household_id,
+                LedgerEntry.entry_type.in_(("expense", "income")),
+                LedgerEntry.status == "posted",
+            )
+            .order_by(LedgerEntry.created_at.desc(), LedgerEntry.id.desc())
+            .limit(40)
         )
-        .order_by(LedgerEntry.created_at.desc())
-        .limit(1)
-    )
-    if entry is None:
-        return None
-    category = await session.get(Category, entry.category_id)
-    if not entry.receipt_id:
-        return (
-            f"Расход: {entry.description}; {entry.original_amount} "
-            f"{entry.original_currency}; категория "
-            f"{category.key if category else 'unknown'}"
-        )
-    receipt = await session.scalar(
-        select(Receipt)
-        .where(Receipt.id == entry.receipt_id)
-        .options(selectinload(Receipt.items))
-    )
-    if receipt is None:
-        return None
-    items = sorted(receipt.items, key=lambda item: item.created_at)
-    category_ids = {item.category_id for item in items if item.category_id}
+    ).all()
+    if not entries:
+        return FinancialConversationContext(prompt=None, entry_ids_by_ref={})
+
     categories = (
-        await session.scalars(select(Category).where(Category.id.in_(category_ids)))
+        await session.scalars(select(Category).where(Category.household_id == household_id))
     ).all()
     category_keys = {category.id: category.key for category in categories}
-    item_context = "; ".join(
-        f"{index}. {item.display_name}, {format_money(item.display_line_total)} "
-        f"{receipt.original_currency or 'KZT'}, категория "
-        f"{category_keys.get(item.category_id, 'unknown')}"
-        for index, item in enumerate(items, 1)
+    receipt_ids = {entry.receipt_id for entry in entries if entry.receipt_id}
+    receipts = (
+        (
+            await session.scalars(
+                select(Receipt)
+                .where(Receipt.id.in_(receipt_ids))
+                .options(selectinload(Receipt.items))
+            )
+        ).all()
+        if receipt_ids
+        else []
     )
-    return (
-        f"Чек магазина {receipt.merchant or 'не указан'}; итог "
-        f"{format_money(receipt.original_total)} {receipt.original_currency or 'KZT'}; "
-        f"позиции: {item_context}"
+    receipts_by_id = {receipt.id: receipt for receipt in receipts}
+
+    lines: list[str] = []
+    entry_ids_by_ref: dict[str, str] = {}
+    seen_receipts: set[str] = set()
+    for entry in entries:
+        if len(lines) >= 12:
+            break
+        if entry.receipt_id and entry.receipt_id in seen_receipts:
+            continue
+        ref = f"T{len(lines) + 1}"
+        entry_ids_by_ref[ref] = entry.id
+        if not entry.receipt_id:
+            category = category_keys.get(entry.category_id, "none")
+            lines.append(
+                f"{ref} | {entry.entry_type} | {entry.description} | "
+                f"{format_money(entry.original_amount)} {entry.original_currency} | "
+                f"category={category} | at={entry.occurred_at.isoformat()}"
+            )
+            continue
+
+        seen_receipts.add(entry.receipt_id)
+        receipt = receipts_by_id.get(entry.receipt_id)
+        if receipt is None:
+            lines.append(
+                f"{ref} | expense receipt | {entry.description} | "
+                f"{format_money(entry.original_amount)} {entry.original_currency} | "
+                f"category={category_keys.get(entry.category_id, 'unknown')} | "
+                f"at={entry.occurred_at.isoformat()}"
+            )
+            continue
+        items = sorted(receipt.items, key=lambda item: item.created_at)
+        item_context = "; ".join(
+            f"{index}. {item.display_name} "
+            f"{format_money(item.display_line_total)} "
+            f"category={category_keys.get(item.category_id, 'unknown')}"
+            for index, item in enumerate(items, 1)
+        )
+        lines.append(
+            f"{ref} | expense receipt | merchant={receipt.merchant or 'unknown'} | "
+            f"total={format_money(receipt.original_total or entry.original_amount)} "
+            f"{receipt.original_currency or entry.original_currency} | "
+            f"items=[{item_context}] | at={entry.occurred_at.isoformat()}"
+        )
+    return FinancialConversationContext(
+        prompt="\n".join(lines),
+        entry_ids_by_ref=entry_ids_by_ref,
     )
 
 
@@ -1653,9 +1684,7 @@ async def build_expense_response(
             f"{entry.original_currency} → <b>{format_money(entry.amount_kzt)} ₸</b>"
         )
         if entry.original_currency != "KZT":
-            lines.append(
-                f"  Курс: 1 {entry.original_currency} = {format_money(rate)} ₸"
-            )
+            lines.append(f"  Курс: 1 {entry.original_currency} = {format_money(rate)} ₸")
         lines.append(
             f"  {category.icon} {category.name} · осталось "
             f"<b>{format_money(remaining)} {envelope_currency}</b>"
@@ -1672,6 +1701,8 @@ def correction_targets_receipt(
         return True
     if interpretation is None:
         return False
+    if interpretation.correction_scope in {"whole_receipt", "receipt_item"}:
+        return True
     if interpretation.merchant or interpretation.receipt_total or interpretation.receipt_currency:
         return True
     return any(
@@ -1684,10 +1715,7 @@ def correction_has_changes(interpretation: ExpenseInterpretation) -> bool:
     if interpretation.merchant or interpretation.receipt_total or interpretation.receipt_currency:
         return True
     return any(
-        item.description
-        or item.amount is not None
-        or item.currency
-        or item.category_key
+        item.description or item.amount is not None or item.currency or item.category_key
         for item in interpretation.items
     )
 
@@ -1709,8 +1737,7 @@ def resolve_corrected_receipt_item(
         for index, item in enumerate(items, 1):
             names = (item.display_name, item.raw_name)
             normalized_names = [
-                " ".join(re.sub(r"[^\w]+", " ", name.casefold()).split())
-                for name in names
+                " ".join(re.sub(r"[^\w]+", " ", name.casefold()).split()) for name in names
             ]
             if any(
                 target_name == name or target_name in name or name in target_name
@@ -1726,8 +1753,7 @@ def resolve_corrected_receipt_item(
     if len(items) == 1:
         return 1, items[0]
     raise ValueError(
-        "В чеке несколько позиций. Укажите номер или название, например: "
-        "«позиция 2 — молоко»"
+        "В чеке несколько позиций. Укажите номер или название, например: «позиция 2 — молоко»"
     )
 
 
@@ -1735,20 +1761,16 @@ def reallocate_receipt_total(items: list[ReceiptItem], new_total: Decimal) -> No
     current_total = sum((Decimal(item.line_total) for item in items), Decimal("0"))
     if new_total <= 0 or current_total <= 0:
         raise ValueError("Итог чека и сумма позиций должны быть положительными")
-    allocations = [
-        quantize(new_total * Decimal(item.line_total) / current_total) for item in items
-    ]
+    allocations = [quantize(new_total * Decimal(item.line_total) / current_total) for item in items]
     residual = quantize(new_total) - sum(allocations, Decimal("0"))
     if residual:
-        largest_index = max(
-            range(len(items)), key=lambda index: Decimal(items[index].line_total)
-        )
+        largest_index = max(range(len(items)), key=lambda index: Decimal(items[index].line_total))
         allocations[largest_index] = quantize(allocations[largest_index] + residual)
     for item, allocation in zip(items, allocations, strict=True):
         item.line_total = allocation
 
 
-async def correct_last_expense(
+async def correct_financial_operation(
     message: Message,
     deps: TelegramDependencies,
     household: Household,
@@ -1756,6 +1778,7 @@ async def correct_last_expense(
     text: str,
     interpretation: ExpenseInterpretation | None = None,
     source_event_key: str | None = None,
+    target_entry_id: str | None = None,
 ) -> None:
     receipt_request = correction_targets_receipt(text, interpretation)
     async with deps.session_factory() as session:
@@ -1768,7 +1791,27 @@ async def correct_last_expense(
             )
         ).all()
         receipt = None
-        if receipt_request:
+        last_entry = None
+        if target_entry_id:
+            last_entry = await session.scalar(
+                select(LedgerEntry).where(
+                    LedgerEntry.id == target_entry_id,
+                    LedgerEntry.household_id == household.id,
+                    LedgerEntry.entry_type.in_(("expense", "income")),
+                    LedgerEntry.status == "posted",
+                )
+            )
+        if last_entry is not None and last_entry.receipt_id:
+            receipt = await session.scalar(
+                select(Receipt)
+                .where(
+                    Receipt.id == last_entry.receipt_id,
+                    Receipt.household_id == household.id,
+                    Receipt.status == "posted",
+                )
+                .options(selectinload(Receipt.items))
+            )
+        elif last_entry is None and receipt_request:
             receipt = await session.scalar(
                 select(Receipt)
                 .where(
@@ -1779,7 +1822,6 @@ async def correct_last_expense(
                 .order_by(Receipt.posted_at.desc(), Receipt.created_at.desc())
                 .limit(1)
             )
-        last_entry = None
         if receipt is not None:
             last_entry = await session.scalar(
                 select(LedgerEntry)
@@ -1791,12 +1833,12 @@ async def correct_last_expense(
                 .order_by(LedgerEntry.created_at.desc())
                 .limit(1)
             )
-        else:
+        elif last_entry is None:
             last_entry = await session.scalar(
                 select(LedgerEntry)
                 .where(
                     LedgerEntry.household_id == household.id,
-                    LedgerEntry.entry_type == "expense",
+                    LedgerEntry.entry_type.in_(("expense", "income")),
                     LedgerEntry.status == "posted",
                 )
                 .order_by(LedgerEntry.created_at.desc())
@@ -1808,18 +1850,18 @@ async def correct_last_expense(
                     .where(Receipt.id == last_entry.receipt_id)
                     .options(selectinload(Receipt.items))
                 )
-        if receipt_request and receipt is None:
+        if receipt_request and receipt is None and last_entry is None:
             await message.reply("Не нашёл последний проведённый чек для исправления.")
             return
         if last_entry is None and receipt is None:
-            await message.reply("Не нашёл последний расход для исправления.")
+            await message.reply("Не нашёл финансовую операцию для исправления.")
             return
 
-        receipt_items = (
-            sorted(receipt.items, key=lambda item: item.created_at) if receipt else []
-        )
+        receipt_items = sorted(receipt.items, key=lambda item: item.created_at) if receipt else []
         previous_category = (
-            await session.get(Category, last_entry.category_id) if last_entry else None
+            await session.get(Category, last_entry.category_id)
+            if last_entry and last_entry.category_id
+            else None
         )
 
     if receipt_items and receipt is not None:
@@ -1837,7 +1879,7 @@ async def correct_last_expense(
         )
     elif last_entry is not None:
         previous_context = (
-            f"Расход: {last_entry.description}; {last_entry.original_amount} "
+            f"{last_entry.entry_type}: {last_entry.description}; {last_entry.original_amount} "
             f"{last_entry.original_currency}; категория "
             f"{previous_category.key if previous_category else 'unknown'}"
         )
@@ -1850,8 +1892,10 @@ async def correct_last_expense(
     )
     if interpretation.kind != "correction" or not correction_has_changes(interpretation):
         await message.reply(
-            "Не понял, что именно исправить. Например: "
-            "<i>«прошлый чек был не 7-Eleven, а Big C»</i>."
+            escape(
+                interpretation.assistant_reply
+                or "Не понял, что именно исправить. Назовите операцию и правильное значение."
+            )
         )
         return
     correction = interpretation.items[0] if interpretation.items else None
@@ -1900,36 +1944,32 @@ async def correct_last_expense(
                             f"<b>{escape(new_merchant)}</b>"
                         )
 
-                        seven_category = category_by_key.get(SEVEN_ELEVEN_CATEGORY_KEY)
-                        if is_seven_eleven_merchant(new_merchant) and seven_category:
-                            for item in items:
-                                item.category_id = seven_category.id
-                                item.subcategory_id = None
-                            changes.append("все позиции перенесены в 🏪 7-Eleven")
-                        elif is_seven_eleven_merchant(old_merchant):
-                            fallback_category = category_by_key.get("groceries_household")
-                            if fallback_category is None:
-                                raise ValueError("Не найдена категория продуктов")
-                            moved = 0
-                            for item in items:
-                                if seven_category is None or item.category_id == seven_category.id:
-                                    item.category_id = fallback_category.id
-                                    item.subcategory_id = None
-                                    moved += 1
-                            if moved:
-                                changes.append(
-                                    f"{moved} поз. перенесено в {fallback_category.icon} "
-                                    f"{escape(fallback_category.name)}"
-                                )
-
                 target_number: int | None = None
                 target: ReceiptItem | None = None
+                whole_receipt_category = bool(
+                    correction
+                    and correction.category_key
+                    and interpretation.correction_scope != "receipt_item"
+                    and correction.target_item_number is None
+                    and not correction.target_item_name
+                )
+                if whole_receipt_category and correction is not None:
+                    corrected_category = category_by_key.get(correction.category_key or "")
+                    if corrected_category is None:
+                        raise ValueError("Категория не найдена")
+                    for item in items:
+                        item.category_id = corrected_category.id
+                        item.subcategory_id = None
+                    changes.append(
+                        f"весь чек перенесён в {corrected_category.icon} "
+                        f"{escape(corrected_category.name)}"
+                    )
                 if correction is not None and any(
                     (
                         correction.description,
                         correction.amount is not None,
                         correction.currency,
-                        correction.category_key,
+                        correction.category_key and not whole_receipt_category,
                     )
                 ):
                     target_number, target = resolve_corrected_receipt_item(items, correction)
@@ -1954,13 +1994,10 @@ async def correct_last_expense(
                     corrected_total = quantize(Decimal(str(interpretation.receipt_total)))
                     reallocate_receipt_total(items, corrected_total)
                     corrected_currency = normalize_currency(
-                        interpretation.receipt_currency
-                        or locked_receipt.original_currency
-                        or "KZT"
+                        interpretation.receipt_currency or locked_receipt.original_currency or "KZT"
                     )
                     changes.append(
-                        f"итог чека: <b>{format_money(corrected_total)} "
-                        f"{corrected_currency}</b>"
+                        f"итог чека: <b>{format_money(corrected_total)} {corrected_currency}</b>"
                     )
 
                 currency = normalize_currency(
@@ -2038,7 +2075,7 @@ async def correct_last_expense(
                         f"{corrected_category.icon if corrected_category else ''} "
                         f"{escape(corrected_category.name) if corrected_category else 'категория'}"
                     )
-                response = "✅ <b>Исправил прошлый чек</b>"
+                response = "✅ <b>Исправил чек</b>"
                 if changes:
                     response += "\n" + "\n".join(f"• {change}" for change in changes)
                 response += (
@@ -2048,44 +2085,70 @@ async def correct_last_expense(
                 )
             else:
                 if last_entry is None or correction is None:
-                    raise ValueError("Последний расход не найден")
+                    raise ValueError("Финансовая операция не найдена")
                 locked_entry = await session.scalar(
                     select(LedgerEntry).where(LedgerEntry.id == last_entry.id).with_for_update()
                 )
                 if locked_entry is None or locked_entry.status != "posted":
-                    await message.reply("Расход уже изменён или удалён.")
+                    await message.reply("Операция уже изменена или удалена.")
                     return
-                category = (
-                    category_by_key.get(correction.category_key)
-                    if correction.category_key
-                    else await session.get(Category, locked_entry.category_id)
-                )
-                if category is None:
-                    raise ValueError("Категория не найдена")
                 cycle = await session.get_one(BudgetCycle, locked_entry.cycle_id)
                 locked_entry.status = "reversed"
-                new_posted = await post_expense(
-                    session,
-                    deps.rate_service,
-                    household,
-                    cycle,
-                    category,
+                corrected_amount = (
                     Decimal(str(correction.amount))
                     if correction.amount is not None
-                    else Decimal(locked_entry.original_amount),
-                    normalize_currency(correction.currency or locked_entry.original_currency),
-                    correction.description or locked_entry.description,
-                    locked_entry.occurred_at.astimezone(deps.settings.timezone),
-                    user_id,
-                    source_event_key=source_event_key,
-                    source_item_index=0,
+                    else Decimal(locked_entry.original_amount)
                 )
+                corrected_currency = normalize_currency(
+                    correction.currency or locked_entry.original_currency
+                )
+                corrected_description = correction.description or locked_entry.description
+                if locked_entry.entry_type == "income":
+                    if correction.category_key:
+                        raise ValueError("У дохода нет расходной категории")
+                    new_posted = await post_income(
+                        session,
+                        deps.rate_service,
+                        household,
+                        cycle,
+                        corrected_amount,
+                        corrected_currency,
+                        corrected_description,
+                        locked_entry.occurred_at.astimezone(deps.settings.timezone),
+                        user_id,
+                        source_event_key=source_event_key,
+                        source_item_index=0,
+                    )
+                    action = "ledger_income_natural_correction"
+                else:
+                    category = (
+                        category_by_key.get(correction.category_key)
+                        if correction.category_key
+                        else await session.get(Category, locked_entry.category_id)
+                    )
+                    if category is None:
+                        raise ValueError("Категория не найдена")
+                    new_posted = await post_expense(
+                        session,
+                        deps.rate_service,
+                        household,
+                        cycle,
+                        category,
+                        corrected_amount,
+                        corrected_currency,
+                        corrected_description,
+                        locked_entry.occurred_at.astimezone(deps.settings.timezone),
+                        user_id,
+                        source_event_key=source_event_key,
+                        source_item_index=0,
+                    )
+                    action = "ledger_expense_natural_correction"
                 new_posted.entry.reversal_of_id = locked_entry.id
                 session.add(
                     AuditLog(
                         household_id=household.id,
                         actor_user_id=user_id,
-                        action="ledger_expense_natural_correction",
+                        action=action,
                         entity_type="ledger_entry",
                         entity_id=new_posted.entry.id,
                         before_data={
@@ -2099,18 +2162,32 @@ async def correct_last_expense(
                             "description": new_posted.entry.description,
                             "amount": str(new_posted.entry.original_amount),
                             "currency": new_posted.entry.original_currency,
-                            "category_id": category.id,
+                            "category_id": new_posted.entry.category_id,
                         },
                     )
                 )
-                response = await build_expense_response(
-                    session, cycle.id, [(new_posted, category)]
-                )
+                if locked_entry.entry_type == "income":
+                    response = (
+                        "✅ <b>Исправил доход</b>\n"
+                        f"• {escape(new_posted.entry.description)}: "
+                        f"{format_money(new_posted.entry.original_amount)} "
+                        f"{new_posted.entry.original_currency} → "
+                        f"<b>{format_money(new_posted.entry.amount_kzt)} ₸</b>\n"
+                        "Старая запись отменена, новая сохранена в базе."
+                    )
+                else:
+                    response = await build_expense_response(
+                        session, cycle.id, [(new_posted, category)]
+                    )
         await message.reply(response, reply_markup=main_menu_keyboard())
     except RateUnavailableError:
         await message.reply("Не удалось исправить: нет актуального курса валюты.")
     except (CurrencyError, InvalidOperation, ValueError) as exc:
-        await message.reply(f"Не удалось исправить расход: {escape(str(exc))}")
+        await message.reply(f"Не удалось исправить операцию: {escape(str(exc))}")
+
+
+# Backwards-compatible name for integrations that imported the old helper.
+correct_last_expense = correct_financial_operation
 
 
 async def authorize_message(

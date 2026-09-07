@@ -117,6 +117,27 @@ def test_seven_eleven_receipt_uses_only_dedicated_category() -> None:
     assert uncertain == []
 
 
+def test_seven_eleven_sim_topup_keeps_mobile_category() -> None:
+    sim_topup = item("Пополнение SIM-карты", "250").model_copy(
+        update={"category_key": "mobile", "subcategory_key": None}
+    )
+    snack = item("Сэндвич", "35")
+
+    prepared, uncertain = prepare_receipt_items(
+        [sim_topup, snack],
+        "CP ALL, 7-Eleven",
+        categories={"seven_eleven": object(), "mobile": object()},  # type: ignore[dict-item]
+        subcategories={},
+        confidence_threshold=0.75,
+    )
+
+    assert [prepared_item.category_key for prepared_item in prepared] == [
+        "mobile",
+        "seven_eleven",
+    ]
+    assert uncertain == []
+
+
 def test_exact_124_baht_seven_eleven_receipt_posts_seven_paid_rows() -> None:
     source_items = [
         item("เนสท์เล่ ลาเต้", "15", "Кофе Nestle Latte"),

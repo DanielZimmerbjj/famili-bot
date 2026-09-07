@@ -51,13 +51,19 @@ class ExpenseInterpretation(BaseModel):
     receipt_total: float | None = Field(default=None, gt=0)
     receipt_currency: str | None = None
     report_period: Literal["today", "yesterday", "current_cycle"] | None = None
-    report_focus: Literal[
-        "full",
-        "summary",
-        "largest_category",
-        "category_breakdown",
-        "recent_expenses",
-    ] | None = None
+    report_focus: (
+        Literal[
+            "full",
+            "summary",
+            "largest_category",
+            "category_breakdown",
+            "recent_expenses",
+        ]
+        | None
+    ) = None
+    target_entry_ref: str | None = None
+    correction_scope: Literal["operation", "whole_receipt", "receipt_item"] | None = None
+    assistant_reply: str | None = None
     items: list[InterpretedExpenseItem]
     overall_confidence: float = Field(ge=0, le=1)
 
@@ -122,9 +128,7 @@ class ExpenseInterpreter:
                 raise
             return await self._interpret_with_model(prompt, self.fallback_model)
 
-    async def _interpret_with_model(
-        self, prompt: str, model: str
-    ) -> ExpenseInterpretation:
+    async def _interpret_with_model(self, prompt: str, model: str) -> ExpenseInterpretation:
         response = await self.client.responses.parse(
             model=model,
             input=[{"role": "user", "content": prompt}],
@@ -144,12 +148,14 @@ class ExpenseInterpreter:
         goals: dict[str, str] | None = None,
     ) -> str:
         category_lines = "\n".join(f"- {key}: {name}" for key, name in categories.items())
-        goal_lines = "\n".join(
-            f"- {key}: {name}" for key, name in (goals or {}).items()
-        ) or "- car: Автомобиль\n- border_run: Бордерран"
+        goal_lines = (
+            "\n".join(f"- {key}: {name}" for key, name in (goals or {}).items())
+            or "- car: Автомобиль\n- border_run: Бордерран"
+        )
         return f"""
-Act as the classifier and bookkeeper for a private Russian-language family-budget chat.
-Understand the whole message and return the supplied JSON schema.
+Act as the conversational financial planner for a private Russian-language family-budget
+chat. Understand the whole message, use the recent-operation context and propose exactly one
+typed action in the supplied JSON schema. The application, not you, validates and executes it.
 
 Message: {text}
 
@@ -164,8 +170,9 @@ Rules:
   savings goal. This updates the same goal and must never create a new one.
 - kind=report when the user asks to show, send or summarize the family finances, budget,
   expenses, income, balances, category limits or savings progress. A report is read-only.
-- kind=correction only when the user clearly corrects the previous operation, for example
-  "нет", "на самом деле", "исправь", "вместо" or "ошибка".
+- kind=correction when the user asks to change an already stored expense, receipt or income.
+  Direct wording is not required: a complaint or question such as "почему ты записал это в
+  7-Eleven, это были SIM-карты" is a correction, not a report or a new expense.
 - kind=other only for a non-financial message or for an attempted new operation whose
   essential amount cannot be determined. A question about already stored expenses, income,
   balances, categories, receipts or savings is always kind=report even though it does not
@@ -204,6 +211,14 @@ Rules:
   them confidently as report instead of rejecting them for having no transaction amount.
 - For a correction, return only values that change; null means keep the previous value.
   Do not use correction for editing a savings goal; use goal_update.
+- Recent operations are labelled T1, T2, etc. For a correction, resolve words such as
+  "прошлый", "последний", a merchant, description, amount or operation type against that list
+  and put the best matching label in target_entry_ref. T1 is the newest operation. Never copy
+  an internal database id. If no operation can be identified reliably, leave target_entry_ref
+  null and explain what detail is needed in assistant_reply.
+- A correction may edit either an expense or an income. Use correction_scope=operation for a
+  regular ledger entry, whole_receipt when the whole receipt needs a merchant, total or category
+  change, and receipt_item only when one numbered or named line item is being corrected.
 - A receipt correction does not need confirmation first: it edits the already-posted
   previous receipt in the database.
 - For a correction of the receipt store/merchant, put the corrected store name in the
@@ -213,13 +228,20 @@ Rules:
   put its currency in receipt_currency. Do not invent a fake line item for the total.
 - target_item_number is only for correcting a numbered receipt item. When the user names
   an existing item instead of its number, put that old/current name in target_item_name;
-  description is the corrected replacement name.
-- category_key must be one of the allowed keys. A purchase explicitly made at 7-Eleven,
-  7-11 or Seven Eleven always uses seven_eleven regardless of the purchased items.
-  Classify other supermarket drinks, milk and snacks as groceries_household unless the
-  message explicitly says they were consumed in a cafe.
+  description is the corrected replacement name. Do not set target_item_name merely to the
+  old category or merchant name.
+- category_key must be one of the allowed keys. The merchant describes where payment happened;
+  it does not override the purpose of the payment. Explicit purpose always wins. In particular,
+  a phone balance, mobile package or SIM-card top-up is category mobile even when it was paid at
+  7-Eleven. Ordinary physical goods bought at 7-Eleven use seven_eleven when no more specific
+  family-budget purpose is stated. Other supermarket drinks, milk and snacks are
+  groceries_household unless the message explicitly says they were consumed in a cafe.
 - Do not invent amounts, merchants, products, categories or currencies. If a correction says
   "for the same money", leave amount null.
+- For kind=other, put a short helpful Russian conversational answer in assistant_reply. Ask one
+  concise clarifying question when a requested financial action lacks a critical detail. Never
+  claim that data was changed unless kind is a mutating typed action. For other kinds,
+  assistant_reply may be null because the application builds the final confirmed response.
 
 Allowed categories:
 {category_lines}
@@ -227,6 +249,6 @@ Allowed categories:
 Existing savings goals (a new goal name is also allowed):
 {goal_lines}
 
-Previous operation, when available:
+Recent operations, newest first, when available:
 {previous_context or "none"}
 """.strip()
